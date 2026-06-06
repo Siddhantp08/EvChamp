@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">EVChamp</string>
+    <string name="title_activity_main">EVChamp</string>
+    <string name="package_name">com.evchamp.app</string>
+    <string name="custom_url_scheme">com.evchamp.app</string>
+</resources>

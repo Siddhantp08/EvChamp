@@ -1,0 +1,238 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Leaflet z-index fix: prevent map controls from overlapping sticky header ── */
+.leaflet-top,
+.leaflet-bottom,
+.leaflet-control,
+.leaflet-pane,
+.leaflet-popup-pane,
+.leaflet-tooltip-pane {
+  z-index: 10 !important;
+}
+.leaflet-map-pane {
+  z-index: 4 !important;
+}
+
+/* ── Hide leaflet-routing-machine instruction panel ── */
+.leaflet-routing-container {
+  display: none !important;
+}
+
+/* ── Global mobile safety ── */
+html, body {
+  overflow-x: clip;
+  max-width: 100vw;
+}
+
+#root {
+  overflow-x: clip;
+}
+
+body {
+  /* Respect notch / status bar / rounded corners on Android & iOS */
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+@keyframes serviceTileReveal {
+  from {
+    opacity: 0;
+    transform: translateY(26px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes homeGradientShift {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+@keyframes floatOrb {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(18px, -20px, 0) scale(1.08);
+  }
+}
+
+.home-page {
+  background-size: 180% 180%;
+  animation: homeGradientShift 18s ease infinite;
+}
+
+.home-ambient {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(70px);
+  opacity: 0.38;
+  pointer-events: none;
+  animation: floatOrb 14s ease-in-out infinite;
+}
+
+.home-orb-1 {
+  width: 18rem;
+  height: 18rem;
+  top: 4rem;
+  left: -3rem;
+  background: rgba(59, 130, 246, 0.28);
+}
+
+.home-orb-2 {
+  width: 20rem;
+  height: 20rem;
+  top: 18rem;
+  right: -4rem;
+  background: rgba(16, 185, 129, 0.24);
+  animation-delay: 2s;
+}
+
+.home-orb-3 {
+  width: 16rem;
+  height: 16rem;
+  bottom: 5rem;
+  left: 28%;
+  background: rgba(250, 204, 21, 0.2);
+  animation-delay: 4s;
+}
+
+.home-section-shell {
+  will-change: transform, opacity;
+}
+
+.partner-banner-frame {
+  position: relative;
+  overflow: hidden;
+}
+
+.partner-banner-frame::before {
+  content: '';
+  position: absolute;
+  top: -20%;
+  left: -30%;
+  width: 35%;
+  height: 140%;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.18) 35%, rgba(255,255,255,0.55) 50%, transparent 100%);
+  transform: skewX(-20deg) translateX(-180%);
+  transition: transform 0.95s ease;
+  pointer-events: none;
+}
+
+.partner-banner-frame:hover::before {
+  transform: skewX(-20deg) translateX(420%);
+}
+
+.partner-banner-image {
+  transition: transform 0.55s ease, box-shadow 0.55s ease;
+}
+
+.partner-banner-frame:hover .partner-banner-image {
+  transform: scale(1.012);
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.12);
+}
+
+.home-footer-shell {
+  transition: transform 0.45s ease;
+}
+
+.home-footer-shell:hover {
+  transform: translateY(-2px);
+}
+
+.service-tile {
+  position: relative;
+  animation: serviceTileReveal 0.7s ease-out both;
+  animation-delay: var(--tile-delay, 0s);
+  will-change: transform, box-shadow;
+}
+
+.service-tile::before {
+  content: '';
+  position: absolute;
+  inset: -20% auto -20% -35%;
+  width: 42%;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.18) 35%, rgba(255,255,255,0.55) 50%, transparent 100%);
+  transform: translateX(-160%) skewX(-22deg);
+  transition: transform 0.8s ease;
+  pointer-events: none;
+}
+
+.service-tile:hover {
+  transform: translateY(-6px) scale(1.01);
+  box-shadow: 0 14px 36px rgba(15, 23, 42, 0.12);
+}
+
+/* On touch devices disable translate to avoid overflow/clipping */
+@media (hover: none) {
+  .service-tile:hover {
+    transform: none;
+    box-shadow: 0 4px 16px rgba(15, 23, 42, 0.08);
+  }
+}
+
+.service-tile:hover::before {
+  transform: translateX(360%) skewX(-22deg);
+}
+
+.service-tile img {
+  transition: transform 0.45s ease, filter 0.45s ease;
+}
+
+.service-tile:hover img {
+  transform: scale(1.05) translateY(-3px);
+  filter: saturate(1.05);
+}
+
+.service-tile-badge,
+.service-tile-arrow {
+  transition: transform 0.3s ease, box-shadow 0.3s ease, border-color 0.3s ease;
+}
+
+.service-tile:hover .service-tile-badge {
+  transform: translateX(2px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-page,
+  .home-ambient,
+  .partner-banner-frame::before,
+  .partner-banner-image,
+  .home-footer-shell,
+  .service-tile,
+  .service-tile::before,
+  .service-tile img,
+  .service-tile-badge,
+  .service-tile-arrow {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* Custom Leaflet popup styles */
+.leaflet-popup-content-wrapper {
+  border-radius: 12px;
+  padding: 0;
+}
+
+.leaflet-popup-content {
+  margin: 0;
+  max-width: 280px;
+}
+
+.leaflet-popup-tip {
+  background: white;
+}

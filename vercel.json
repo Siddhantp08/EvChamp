@@ -1,0 +1,48 @@
+{
+  "buildCommand": "CI=false npm run build",
+  "outputDirectory": "build",
+  "framework": "create-react-app",
+  "functions": {
+    "api/chat.py": {
+      "includeFiles": "Chatbot2.0/app/**",
+      "maxDuration": 60
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/python_api/:path*",
+      "destination": "/api/chat"
+    },
+    {
+      "source": "/api/users/sync",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/api/contact",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/api/zevault-credits",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/api/:path*",
+      "destination": "http://100.24.9.16:5000/api/:path*"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=*, microphone=*, geolocation=*, usb=*"
+        }
+      ]
+    }
+  ]
+}

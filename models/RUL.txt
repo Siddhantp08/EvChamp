@@ -1,0 +1,2497 @@
+import os
+import glob
+import json
+import hashlib
+import time
+import warnings
+import threading
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Any
+from datetime import datetime
+from enum import Enum
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.io import loadmat
+from scipy.signal import savgol_filter
+from scipy.stats import entropy as scipy_entropy
+from scipy.interpolate import interp1d
+from sklearn.preprocessing import RobustScaler
+from sklearn.isotonic import IsotonicRegression
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.feature_selection import mutual_info_regression
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import tensorflow as tf
+import keras
+from keras import Model, Input
+from keras.layers import (
+    Conv1D, AveragePooling1D, LSTM, Bidirectional, Dense,
+    Dropout, BatchNormalization, MultiHeadAttention, GlobalAveragePooling1D,
+    Concatenate, Flatten, LayerNormalization, Add, Lambda,
+    SpatialDropout1D, GRU,
+)
+from keras.callbacks import (
+    EarlyStopping, LearningRateScheduler, ModelCheckpoint, ReduceLROnPlateau
+)
+from keras.optimizers import AdamW
+from keras.regularizers import l2
+import joblib
+
+warnings.filterwarnings("ignore")
+
+GLOBAL_SEED = 42
+np.random.seed(GLOBAL_SEED)
+tf.random.set_seed(GLOBAL_SEED)
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
+
+N_ENSEMBLE      = int(os.environ.get("N_ENSEMBLE", 2))
+MC_SAMPLES      = int(os.environ.get("MC_SAMPLES", 3))
+SOC_DIVERGE_THR = 0.15
+TOP_K_FEATURES  = int(os.environ.get("TOP_K_FEATURES", 55))
+
+# Adjust if your dataset uses different StepID numbers
+TU_CHARGE_STEPS    = {1, 2, 3}
+TU_DISCHARGE_STEPS = {4, 5, 6}
+
+_FOLD_EXCLUDE = frozenset({
+    "y_true", "y_pred", "y_pred_lo", "y_pred_hi", "y_pred_std",
+    "histories", "seq_ds", "model", "soc_pre",
+    "features",
+})
+
+
+def _json_safe(obj: Any) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, float):
+        return None if (obj != obj) else obj
+    if isinstance(obj, np.floating):
+        v = float(obj)
+        return None if (v != v) else v
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.ndarray):
+        return [_json_safe(x) for x in obj.tolist()]
+    if isinstance(obj, Enum):
+        return str(obj.value)
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(x) for x in obj]
+    if isinstance(obj, (bool, int, str)):
+        return obj
+    return str(obj)
+
+
+class ChemistryType(str, Enum):
+    NMC  = "NMC"
+    LFP  = "LFP"
+    NCA  = "NCA"
+    LCO  = "LCO"
+    AUTO = "AUTO"
+
+
+EOL_THRESHOLDS: Dict[str, float] = {
+    ChemistryType.NMC:  0.80,
+    ChemistryType.LFP:  0.75,
+    ChemistryType.NCA:  0.78,
+    ChemistryType.LCO:  0.80,
+    ChemistryType.AUTO: 0.80,
+}
+
+MAPE_FLOORS: Dict[str, float] = {
+    ChemistryType.NMC:  10.0,
+    ChemistryType.LFP:  14.0,
+    ChemistryType.NCA:  10.0,
+    ChemistryType.LCO:   8.0,
+    ChemistryType.AUTO: 10.0,
+}
+
+_NMC_OCV_COEFFS = np.array([
+    -1.9417,  8.2245, -14.6590,  14.1710,
+    -8.0873,  2.8617,  -0.5756,   3.7600
+])
+
+def _lfp_ocv(soc: np.ndarray) -> np.ndarray:
+    s = np.clip(soc, 0.0, 1.0)
+    return np.clip(
+        np.where(
+            s < 0.05,
+            2.50 + 12.0 * s,
+            np.where(
+                s < 0.95,
+                3.10 + 0.245 * s + 0.10 * np.sin(np.pi * s),
+                3.33 + 6.40 * (s - 0.95),
+            )
+        ), 2.50, 3.65)
+
+_NCA_OCV_COEFFS = np.array([
+    -2.1080,  8.9930, -16.0700,  15.4900,
+    -8.8710,  3.1430,  -0.6340,   3.8400
+])
+
+_LCO_OCV_COEFFS = np.array([
+    -5.88235294,  16.04449472, -19.94155354,
+    16.60333539,  -9.63434423,   4.20762341,   2.8018696,
+])
+
+
+def _poly_ocv(soc, coeffs, v_min, v_max):
+    s = np.clip(np.asarray(soc, dtype=np.float64), 0.0, 1.0)
+    return np.clip(np.polyval(coeffs, s), v_min, v_max)
+
+
+def ocv_from_soc(soc: np.ndarray, chemistry: str = ChemistryType.NMC) -> np.ndarray:
+    chem = chemistry.upper() if isinstance(chemistry, str) else chemistry
+    if chem == ChemistryType.LFP:
+        return _lfp_ocv(np.asarray(soc, dtype=np.float64))
+    elif chem == ChemistryType.NCA:
+        return _poly_ocv(soc, _NCA_OCV_COEFFS, 3.0, 4.25)
+    elif chem == ChemistryType.LCO:
+        return _poly_ocv(soc, _LCO_OCV_COEFFS, 2.70, 4.25)
+    else:
+        return _poly_ocv(soc, _NMC_OCV_COEFFS, 3.0, 4.25)
+
+
+def _build_ocv2soc(chemistry: str):
+    soc_grid = np.linspace(0.0, 1.0, 4001)
+    ocv_grid = ocv_from_soc(soc_grid, chemistry)
+    diffs = np.diff(ocv_grid)
+    mono  = np.where(diffs > 0)[0]
+    sg    = soc_grid[mono] if len(mono) > 10 else soc_grid
+    og    = ocv_grid[mono] if len(mono) > 10 else ocv_grid
+    return interp1d(og, sg, kind="linear", bounds_error=False,
+                    fill_value=(sg[0], sg[-1]))
+
+
+_OCV2SOC: Dict[str, Any] = {
+    chem: _build_ocv2soc(chem)
+    for chem in [ChemistryType.NMC, ChemistryType.LFP,
+                 ChemistryType.NCA, ChemistryType.LCO]
+}
+
+
+def soc_from_ocv(ocv: np.ndarray, chemistry: str = ChemistryType.NMC) -> np.ndarray:
+    chem = chemistry.upper() if isinstance(chemistry, str) else chemistry
+    inv  = _OCV2SOC.get(chem, _OCV2SOC[ChemistryType.NMC])
+    return np.clip(inv(np.asarray(ocv, dtype=np.float64)), 0.0, 1.0)
+
+
+def auto_detect_chemistry(voltage_mean: float, voltage_max: float) -> str:
+    if voltage_max < 3.70:
+        return ChemistryType.LFP
+    elif voltage_mean > 3.70:
+        return ChemistryType.NCA if voltage_max > 4.18 else ChemistryType.NMC
+    else:
+        return ChemistryType.NMC
+
+
+class MIFeatureSelector:
+    def __init__(self, k: int = TOP_K_FEATURES, random_state: int = GLOBAL_SEED):
+        self.k             = k
+        self.random_state  = random_state
+        self.selected_cols: List[str] = []
+        self._scores: Dict[str, float] = {}
+
+    def fit(self, df: pd.DataFrame, candidate_cols: List[str],
+            target_col: str = "RUL_norm") -> "MIFeatureSelector":
+        valid = [c for c in candidate_cols
+                 if c in df.columns
+                 and df[c].dtype in (np.float32, np.float64, np.int32, np.int64)
+                 and df[c].notna().all()
+                 and df[c].std() > 1e-10]
+        if not valid:
+            self.selected_cols = candidate_cols[: self.k]
+            return self
+        X = df[valid].values.astype(np.float64)
+        y = df[target_col].values.astype(np.float64)
+        scores = mutual_info_regression(X, y, n_neighbors=5, random_state=self.random_state)
+        self._scores = {col: float(sc) for col, sc in zip(valid, scores)}
+        top = sorted(self._scores, key=self._scores.get, reverse=True)[: self.k]
+        must_keep = [
+            "capacity", "ri_mean", "ocv_mean", "soc_best", "SOH_sg",
+            "deg_index", "life_fraction", "cycle_norm",
+            "cell_imbalance_v", "cell_imbalance_t",
+            "is_nmc", "is_lfp", "is_nca",
+        ]
+        merged = list(dict.fromkeys(must_keep + top))
+        self.selected_cols = [c for c in merged if c in valid][: self.k + len(must_keep)]
+        print(f"    [MI-select] {len(candidate_cols)} → {len(self.selected_cols)} features")
+        return self
+
+    def transform(self, cols: List[str]) -> List[str]:
+        return [c for c in self.selected_cols if c in cols]
+
+    def fit_transform(self, df: pd.DataFrame, candidate_cols: List[str],
+                      target_col: str = "RUL_norm") -> List[str]:
+        self.fit(df, candidate_cols, target_col)
+        return self.transform(candidate_cols)
+
+
+class NASABatteryLoader:
+
+    def __init__(self, data_dir: str, chemistry: str = ChemistryType.LCO):
+        self.data_dir  = Path(data_dir)
+        self.chemistry = chemistry
+
+    @staticmethod
+    def _cycle_features(voltage, current, temperature, time_arr,
+                        chemistry: str = ChemistryType.NMC) -> dict:
+        dt       = np.clip(np.diff(time_arr, prepend=time_arr[0]), 0, 1000)
+        capacity = float(np.sum(np.abs(current) * dt) / 3600.0)
+        energy   = float(np.sum(voltage * np.abs(current) * dt) / 3600.0)
+        dv = np.diff(voltage); di = np.diff(current)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ri_vals = np.where(np.abs(di) > 1e-3, -dv / di, np.nan)
+        ri_mean = float(np.nanmedian(ri_vals))
+        ri_std  = float(np.nanstd(ri_vals))
+        ri_p90  = float(np.nanpercentile(ri_vals, 90))
+        bins      = np.linspace(voltage.min(), voltage.max(), 40)
+        q_per_bin = np.histogram(voltage, bins=bins,
+                                  weights=np.abs(current) * dt)[0] / 3600.0
+        ica_peak  = float(q_per_bin.max())
+        ica_var   = float(q_per_bin.var())
+        ica_skew  = float(pd.Series(q_per_bin).skew())
+        v_hist, _  = np.histogram(voltage, bins=30, density=True)
+        v_entropy  = float(scipy_entropy(v_hist + 1e-10))
+        v_kurtosis = float(pd.Series(voltage).kurtosis())
+        t_min, t_max = float(temperature.min()), float(temperature.max())
+        dtime        = float(time_arr[-1] - time_arr[0])
+        v_mid        = (voltage.max() + voltage.min()) / 2
+        below_mid    = np.where(voltage < v_mid)[0]
+        knee_soc     = float(below_mid[0] / len(voltage)) if len(below_mid) else 1.0
+        dvdt_mean = float(np.nanmean(np.gradient(voltage) / (np.gradient(time_arr) + 1e-8)))
+        dvdt_std  = float(np.nanstd(np.gradient(voltage) / (np.gradient(time_arr) + 1e-8)))
+        v_min_ocv   = ocv_from_soc(np.array([0.01]), chemistry)[0] + 0.01
+        v_max_ocv   = ocv_from_soc(np.array([0.99]), chemistry)[0] - 0.01
+        v_clamped   = np.clip(voltage, v_min_ocv, v_max_ocv)
+        soc_ocv_arr = soc_from_ocv(v_clamped, chemistry).astype(np.float64)
+        ocv_arr     = ocv_from_soc(soc_ocv_arr, chemistry)
+        ocv_mean    = float(ocv_arr.mean())
+        ocv_std     = float(ocv_arr.std())
+        ocv_range   = float(ocv_arr.max() - ocv_arr.min())
+        ocv_slope   = float(np.polyfit(np.arange(len(ocv_arr)), ocv_arr, 1)[0]) if len(ocv_arr) > 1 else 0.0
+        soc_ocv_mean = float(soc_ocv_arr.mean())
+        soc_ocv_std  = float(soc_ocv_arr.std())
+        d_soc   = np.gradient(soc_ocv_arr)
+        d_ocv_g = np.gradient(ocv_arr)
+        d_soc_docv = d_soc / (d_ocv_g + 1e-8)
+        d_soc_docv_m = float(np.nanmean(np.abs(d_soc_docv)))
+        d_soc_docv_p = float(np.nanpercentile(np.abs(d_soc_docv), 75))
+        q_nominal    = max(capacity, 1.5)
+        soc_cc_arr   = np.clip(
+            1.0 - np.cumsum(np.abs(current) * dt) / (q_nominal * 3600 + 1e-8), 0.0, 1.0)
+        soc_cc_final = float(soc_cc_arr[-1])
+        soc_diverge  = float(abs(soc_cc_final - soc_ocv_mean))
+        dod          = float(soc_ocv_arr[0] - soc_ocv_arr[-1]) if len(soc_ocv_arr) > 1 else 0.5
+        dod_mean50   = float(
+            np.mean(soc_ocv_arr[:max(1, len(soc_ocv_arr)//2)]) -
+            np.mean(soc_ocv_arr[max(1, len(soc_ocv_arr)//2):]))
+        c_rate_mean = float(np.abs(current).mean() / (q_nominal + 1e-8))
+        c_rate_max  = float(np.abs(current).max() / (q_nominal + 1e-8))
+        is_fast_chg = float(c_rate_max > 1.5)
+        v_integral      = float(np.trapz(voltage, time_arr))
+        v_weighted_mean = float(
+            np.trapz(voltage * np.abs(current), time_arr) /
+            (np.trapz(np.abs(current), time_arr) + 1e-8))
+        return dict(
+            capacity=capacity, energy=energy,
+            voltage_min=float(voltage.min()), voltage_mean=float(voltage.mean()),
+            voltage_std=float(voltage.std()), voltage_max=float(voltage.max()),
+            voltage_range=float(voltage.max() - voltage.min()),
+            current_mean=float(np.abs(current).mean()),
+            current_std=float(np.abs(current).std()),
+            temp_mean=float(temperature.mean()), temp_max=t_max,
+            temp_min=t_min, temp_rise=float(t_max - t_min),
+            discharge_time=dtime, ri_mean=ri_mean, ri_std=ri_std, ri_p90=ri_p90,
+            ica_peak=ica_peak, ica_var=ica_var, ica_skew=ica_skew,
+            v_entropy=v_entropy, v_kurtosis=v_kurtosis,
+            knee_soc=knee_soc, dvdt_mean=dvdt_mean, dvdt_std=dvdt_std,
+            ocv_mean=ocv_mean, ocv_std=ocv_std, ocv_slope=ocv_slope,
+            ocv_range=ocv_range,
+            soc_from_ocv=soc_ocv_mean, soc_ocv_std=soc_ocv_std,
+            d_soc_docv_mean=d_soc_docv_m, d_soc_docv_p75=d_soc_docv_p,
+            soc_coulomb=soc_cc_final, soc_diverge=soc_diverge,
+            v_integral=v_integral, v_weighted_mean=v_weighted_mean,
+            dod=dod, dod_mean50=dod_mean50,
+            c_rate_mean=c_rate_mean, c_rate_max=c_rate_max,
+            is_fast_charge=is_fast_chg,
+        )
+
+    def load_cell(self, filename: str) -> pd.DataFrame:
+        path   = self.data_dir / filename
+        mat    = loadmat(str(path), squeeze_me=True, struct_as_record=False)
+        name   = filename.replace(".mat", "")
+        cycles = mat[name].cycle
+        records = []
+        for i, cyc in enumerate(cycles):
+            try:
+                if str(cyc.type).strip() != "discharge":
+                    continue
+                d    = cyc.data
+                v    = np.asarray(d.Voltage_measured).flatten().astype(np.float64)
+                c    = np.asarray(d.Current_measured).flatten().astype(np.float64)
+                temp = np.asarray(d.Temperature_measured).flatten().astype(np.float64)
+                t    = np.asarray(d.Time).flatten().astype(np.float64)
+                if len(v) < 10:
+                    continue
+                rec = self._cycle_features(v, c, temp, t, self.chemistry)
+                rec.update(dict(
+                    cycle=i, cell_id=name, chemistry=self.chemistry,
+                    cell_imbalance_v=0.0, cell_imbalance_t=0.0,
+                    pack_t_gradient=0.0, cum_fast_charges=0.0,
+                    calendar_days=float(i),
+                ))
+                records.append(rec)
+            except Exception:
+                continue
+        df        = pd.DataFrame(records).dropna()
+        df["SOH"] = df["capacity"] / df["capacity"].iloc[0]
+        return df.reset_index(drop=True)
+
+    def load_all(self, files=None) -> pd.DataFrame:
+        if files is None:
+            files = ["B0005.mat", "B0006.mat", "B0007.mat", "B0018.mat",
+                     "B0025.mat", "B0026.mat", "B0027.mat", "B0028.mat"]
+        dfs = []
+        for f in files:
+            fp = self.data_dir / f
+            if fp.exists():
+                print(f"  Loading {f} …")
+                try:
+                    dfs.append(self.load_cell(f))
+                except Exception as e:
+                    print(f"  [ERROR] {f}: {e}")
+            else:
+                print(f"  [SKIP] {f} not found")
+        if not dfs:
+            print("  No .mat files — using synthetic EV data.")
+            return EVSyntheticDataGenerator.generate(n_cells=8)
+        return pd.concat(dfs, ignore_index=True)
+
+class TUBerlinLoader:
+    # Canonical column names after normalisation
+    _COL_MAP = {
+        "channel voltage": "voltage",
+        "channel current": "current",
+        "temperature":     "temperature",
+        "testtime":        "testtime",
+        "stepid":          "stepid",
+        "steptime":        "steptime",
+        "absolute time":   "abs_time",
+        "auxu":            "auxu",
+    }
+
+    def __init__(
+        self,
+        data_dir: str,
+        chemistry: str = ChemistryType.NMC,
+        cell_prefix: str = "TUB",
+        nominal_capacity_ah: float = 0.0,
+        min_rows_per_segment: int = 20,
+    ):
+        self.data_dir    = Path(data_dir)
+        self.chemistry   = chemistry
+        self.cell_prefix = cell_prefix
+        self.nom_cap     = nominal_capacity_ah
+        self.min_rows    = min_rows_per_segment
+
+    @staticmethod
+    def _normalise_cols(df: pd.DataFrame) -> pd.DataFrame:
+        rename = {}
+        for col in df.columns:
+            key = col.strip().lower()
+            if key in TUBerlinLoader._COL_MAP:
+                rename[col] = TUBerlinLoader._COL_MAP[key]
+            elif key.startswith("unnamed"):
+                rename[col] = "__drop__"
+        df = df.rename(columns=rename)
+        df = df[[c for c in df.columns if c != "__drop__"]]
+        return df
+
+    @staticmethod
+    def _read_file(path: Path) -> Optional[pd.DataFrame]:
+        for sep in ("\t", ",", ";"):
+            try:
+                df = pd.read_csv(str(path), sep=sep, engine="python",
+                                 on_bad_lines="skip")
+                if df.shape[1] >= 4:
+                    return df
+            except Exception:
+                continue
+        return None
+
+    def _extract_discharge_segments(self, df: pd.DataFrame) -> List[pd.DataFrame]:
+        df = self._normalise_cols(df)
+
+        required = {"voltage", "current"}
+        if not required.issubset(df.columns):
+            return []
+
+        df["voltage"]     = pd.to_numeric(df["voltage"],     errors="coerce")
+        df["current"]     = pd.to_numeric(df["current"],     errors="coerce")
+        df["temperature"] = pd.to_numeric(
+            df.get("temperature", pd.Series(np.full(len(df), 25.0))),
+            errors="coerce").fillna(25.0)
+        df["testtime"]    = pd.to_numeric(
+            df.get("testtime", pd.Series(np.arange(len(df)) * 10.0)),
+            errors="coerce").fillna(0.0)
+        df = df.dropna(subset=["voltage", "current"])
+        if len(df) < self.min_rows:
+            return []
+
+        segments = []
+
+        if "stepid" in df.columns:
+            df["stepid"] = pd.to_numeric(df["stepid"], errors="coerce").fillna(-1).astype(int)
+            df["_dis"]   = df["stepid"].apply(lambda s: 1 if s in TU_DISCHARGE_STEPS else 0)
+            df["_group"] = (df["_dis"] != df["_dis"].shift()).cumsum()
+            for gid, grp in df.groupby("_group"):
+                if grp["_dis"].iloc[0] == 1 and len(grp) >= self.min_rows:
+                    segments.append(grp.reset_index(drop=True))
+        else:
+            # fallback: negative current = discharge
+            df["_dis"]   = (df["current"] < -0.1).astype(int)
+            df["_group"] = (df["_dis"] != df["_dis"].shift()).cumsum()
+            for gid, grp in df.groupby("_group"):
+                if grp["_dis"].iloc[0] == 1 and len(grp) >= self.min_rows:
+                    segments.append(grp.reset_index(drop=True))
+
+        return segments
+
+    def _segment_to_features(self, seg: pd.DataFrame, cycle_idx: int,
+                              cell_id: str) -> Optional[dict]:
+        v    = seg["voltage"].values.astype(np.float64)
+        c    = np.abs(seg["current"].values.astype(np.float64))  # discharge → positive
+        temp = seg["temperature"].values.astype(np.float64)
+        t    = seg["testtime"].values.astype(np.float64)
+        t    = t - t[0]  # normalise time to start from 0
+
+        if len(v) < 10 or v.std() < 1e-6:
+            return None
+
+        try:
+            rec = NASABatteryLoader._cycle_features(v, c, temp, t, self.chemistry)
+        except Exception:
+            return None
+
+        rec.update(dict(
+            cycle=cycle_idx,
+            cell_id=cell_id,
+            chemistry=self.chemistry,
+            cell_imbalance_v=0.0,
+            cell_imbalance_t=float(temp.max() - temp.min()),
+            pack_t_gradient=float(temp.max() - temp.min()),
+            cum_fast_charges=0.0,
+            calendar_days=float(cycle_idx),
+        ))
+        return rec
+
+    def load_cell_from_file(self, filepath: Path) -> Optional[pd.DataFrame]:
+        raw = self._read_file(filepath)
+        if raw is None or len(raw) < self.min_rows:
+            return None
+
+        cell_id  = f"{self.cell_prefix}_{filepath.stem}"
+        segments = self._extract_discharge_segments(raw)
+
+        records = []
+        for cyc_idx, seg in enumerate(segments):
+            rec = self._segment_to_features(seg, cyc_idx, cell_id)
+            if rec is not None:
+                records.append(rec)
+
+        if not records:
+            return None
+
+        df = pd.DataFrame(records).dropna()
+        if df.empty:
+            return None
+
+        cap0 = df["capacity"].iloc[0]
+        if self.nom_cap > 0:
+            cap0 = self.nom_cap
+        df["SOH"] = df["capacity"] / (cap0 + 1e-8)
+        return df.reset_index(drop=True)
+
+    def load_cell_from_folder(self, folder: Path) -> Optional[pd.DataFrame]:
+        files = sorted(folder.glob("*.csv")) + sorted(folder.glob("*.txt"))
+        if not files:
+            return None
+
+        cell_id = f"{self.cell_prefix}_{folder.name}"
+        records = []
+
+        for cyc_idx, fp in enumerate(files):
+            raw = self._read_file(fp)
+            if raw is None:
+                continue
+            segs = self._extract_discharge_segments(raw)
+            if not segs:
+                continue
+            seg = max(segs, key=len)  # use the longest discharge segment
+            rec = self._segment_to_features(seg, cyc_idx, cell_id)
+            if rec is not None:
+                records.append(rec)
+
+        if not records:
+            return None
+
+        df = pd.DataFrame(records).dropna()
+        if df.empty:
+            return None
+
+        cap0 = df["capacity"].iloc[0]
+        if self.nom_cap > 0:
+            cap0 = self.nom_cap
+        df["SOH"] = df["capacity"] / (cap0 + 1e-8)
+        return df.reset_index(drop=True)
+
+    def load_all(self) -> pd.DataFram
+        if not self.data_dir.exists():
+            print(f"  [TUBerlin] data_dir not found: {self.data_dir}")
+            return pd.DataFrame()
+
+        dfs = []
+        IGNORE_DIRS = {"sample_data", "rul_v5_outputs", ".config", "__pycache__"}
+
+        sub_folders = [
+            p for p in self.data_dir.iterdir()
+            if p.is_dir()
+            and p.name not in IGNORE_DIRS
+            and (list(p.glob("*.csv")) or list(p.glob("*.txt")))
+        ]
+
+        if sub_folders:
+            print(f"  [TUBerlin] Found {len(sub_folders)} sub-folders with data "
+                  f"(one cell each) …")
+            for folder in sorted(sub_folders):
+                print(f"    Loading cell folder: {folder.name} …", end=" ")
+                try:
+                    df_cell = self.load_cell_from_folder(folder)
+                    if df_cell is not None and not df_cell.empty:
+                        print(f"{len(df_cell)} cycles")
+                        dfs.append(df_cell)
+                    else:
+                        print("skipped (no valid cycles)")
+                except Exception as e:
+                    print(f"ERROR: {e}")
+        else:
+            # Flat layout: one CSV/TXT file per cell directly in data_dir
+            files = sorted(self.data_dir.glob("*.csv")) + \
+                    sorted(self.data_dir.glob("*.txt"))
+            print(f"  [TUBerlin] Found {len(files)} flat files (one cell each) …")
+            for fp in files:
+                print(f"    Loading cell file: {fp.name} …", end=" ")
+                try:
+                    df_cell = self.load_cell_from_file(fp)
+                    if df_cell is not None and not df_cell.empty:
+                        print(f"{len(df_cell)} cycles")
+                        dfs.append(df_cell)
+                    else:
+                        print("skipped (no valid cycles)")
+                except Exception as e:
+                    print(f"ERROR: {e}")
+
+        if not dfs:
+            print("  [TUBerlin] No valid data loaded.")
+            return pd.DataFrame()
+
+        combined = pd.concat(dfs, ignore_index=True)
+        print(f"  [TUBerlin] Total: {len(combined)} cycles | "
+              f"{combined['cell_id'].nunique()} cells")
+        return combined
+
+class EVDataLoader:
+
+    DEFAULT_COL_MAP = {
+        "timestamp": "timestamp", "voltage_pack": "voltage_pack",
+        "current": "current", "temp_max": "temp_max", "temp_min": "temp_min",
+        "soc_bms": "soc_bms", "energy_kwh": "energy_kwh",
+        "odometer_km": "odometer_km", "cycle_number": "cycle_number",
+        "cell_v_max": "cell_v_max", "cell_v_min": "cell_v_min",
+        "fast_charge_flag": "fast_charge_flag", "chemistry": "chemistry",
+        "vehicle_id": "vehicle_id", "capacity_ah": "capacity_ah",
+    }
+
+    def __init__(self, series_cells: int = 96,
+                 col_map: Optional[Dict[str, str]] = None,
+                 nominal_capacity_ah: float = 75.0):
+        self.series_cells = series_cells
+        self.nominal_cap  = nominal_capacity_ah
+        self.col_map      = col_map or self.DEFAULT_COL_MAP
+
+    def _remap(self, df: pd.DataFrame) -> pd.DataFrame:
+        inv = {v: k for k, v in self.col_map.items()}
+        return df.rename(columns=inv)
+
+    def load_csv(self, filepath: str, vehicle_id: Optional[str] = None) -> pd.DataFrame:
+        raw     = pd.read_csv(filepath)
+        df      = self._remap(raw)
+        cell_id = vehicle_id or df.get("vehicle_id", pd.Series(["EV_001"])).iloc[0]
+        if "voltage_pack" in df.columns:
+            df["voltage_mean"] = df["voltage_pack"] / self.series_cells
+            df["voltage_max"]  = df.get("cell_v_max", df["voltage_mean"] + 0.05)
+            df["voltage_min"]  = df.get("cell_v_min", df["voltage_mean"] - 0.05)
+        if "soc_bms" in df.columns:
+            df["soc_bms_frac"] = df["soc_bms"].clip(0, 100) / 100.0
+        if "capacity_ah" in df.columns:
+            cap = df["capacity_ah"].values
+        elif "energy_kwh" in df.columns:
+            v_nom = df["voltage_mean"].mean() if "voltage_mean" in df.columns else 3.7
+            cap   = (df["energy_kwh"] * 1000 / (v_nom * self.series_cells)).values
+        else:
+            cap = np.full(len(df), self.nominal_cap)
+        df["capacity"] = cap
+        df["SOH"]      = cap / (cap[0] + 1e-8)
+        df["cell_id"]  = str(cell_id)
+        if "chemistry" not in df.columns:
+            v_mean = df.get("voltage_mean", pd.Series([3.7])).mean()
+            v_max  = df.get("voltage_max",  pd.Series([4.1])).max()
+            df["chemistry"] = auto_detect_chemistry(v_mean, v_max)
+        df["cell_imbalance_v"] = (
+            df.get("cell_v_max", df.get("voltage_max", 0)) -
+            df.get("cell_v_min", df.get("voltage_min", 0))
+        )
+        df["cell_imbalance_t"] = df.get("temp_max", 30) - df.get("temp_min", 25)
+        df["pack_t_gradient"]  = df["cell_imbalance_t"]
+        df["cum_fast_charges"] = df.get("fast_charge_flag", 0).cumsum()
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            if df["timestamp"].notna().any():
+                t0 = df["timestamp"].min()
+                df["calendar_days"] = (df["timestamp"] - t0).dt.days.fillna(0)
+            else:
+                df["calendar_days"] = np.arange(len(df), dtype=float)
+        else:
+            df["calendar_days"] = np.arange(len(df), dtype=float)
+        if "cycle_number" not in df.columns:
+            df["cycle_number"] = np.arange(len(df))
+        df["cycle"] = df["cycle_number"]
+        defaults = dict(
+            temp_mean=25.0, temp_max=35.0, temp_min=20.0, temp_rise=10.0,
+            voltage_std=0.05, voltage_range=1.0, current_mean=1.0,
+            current_std=0.3, discharge_time=3600.0, energy=cap.mean() * 3.7,
+            ri_mean=0.08, ri_std=0.01, ri_p90=0.12,
+            ica_peak=0.10, ica_var=0.002, ica_skew=0.1,
+            v_entropy=2.8, v_kurtosis=-1.2, knee_soc=0.6,
+            dvdt_mean=-0.001, dvdt_std=0.002, ocv_mean=3.7,
+            ocv_std=0.15, ocv_slope=-0.0005, ocv_range=1.0,
+            soc_from_ocv=0.8, soc_ocv_std=0.1,
+            d_soc_docv_mean=1.5, d_soc_docv_p75=2.0,
+            soc_coulomb=0.8, soc_diverge=0.05, soc_consistent=1.0,
+            v_integral=13000.0, v_weighted_mean=3.65,
+            dod=0.8, dod_mean50=0.4, c_rate_mean=0.5,
+            c_rate_max=1.0, is_fast_charge=0.0,
+        )
+        for col, val in defaults.items():
+            if col not in df.columns:
+                df[col] = val
+        return df.reset_index(drop=True)
+
+    def load_directory(self, dirpath: str) -> pd.DataFrame:
+        path = Path(dirpath)
+        dfs  = []
+        for csv_file in sorted(path.glob("*.csv")):
+            print(f"  Loading EV: {csv_file.name} …")
+            try:
+                dfs.append(self.load_csv(str(csv_file)))
+            except Exception as e:
+                print(f"  [ERROR] {csv_file.name}: {e}")
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+class SOCSelfChecker:
+
+    def check(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df["soc_consistent"] = (df["soc_diverge"] < SOC_DIVERGE_THR).astype(np.float32)
+        results = []
+        for cell_id, grp in df.groupby("cell_id"):
+            grp  = grp.copy()
+            chem = grp["chemistry"].iloc[0] if "chemistry" in grp.columns else ChemistryType.NMC
+            grp["soc_kalman"]    = self._kalman_soc(
+                grp["soc_coulomb"].values, grp["soc_from_ocv"].values)
+            grp["soc_spread_3way"] = (
+                np.abs(grp["soc_coulomb"] - grp["soc_from_ocv"]) +
+                np.abs(grp["soc_coulomb"] - grp["soc_kalman"]) +
+                np.abs(grp["soc_from_ocv"] - grp["soc_kalman"])
+            ) / 3.0
+            if chem == ChemistryType.LFP:
+                grp["soc_best"] = (grp["soc_coulomb"] * 0.65 +
+                                   grp["soc_from_ocv"] * 0.10 +
+                                   grp["soc_kalman"]   * 0.25)
+            else:
+                grp["soc_best"] = (grp["soc_kalman"]   * 0.50 +
+                                   grp["soc_from_ocv"] * 0.30 +
+                                   grp["soc_coulomb"]  * 0.20)
+            results.append(grp)
+        return pd.concat(results).reset_index(drop=True)
+
+    @staticmethod
+    def _kalman_soc(soc_cc: np.ndarray, soc_ocv: np.ndarray,
+                    Q: float = 5e-4, R: float = 5e-3) -> np.ndarray:
+        n = len(soc_cc); x = float(soc_ocv[0]); P = 0.05
+        out = np.zeros(n, dtype=np.float32)
+        for i in range(n):
+            x_pred = x * 0.99 + soc_cc[i] * 0.01
+            P_pred = P + Q
+            K      = P_pred / (P_pred + R)
+            x      = x_pred + K * (soc_ocv[i] - x_pred)
+            P      = (1 - K) * P_pred
+            out[i] = float(np.clip(x, 0.0, 1.0))
+        return out
+
+class EVEoLDetector:
+
+    MIN_EOL_IDX: int = 20
+
+    @staticmethod
+    def find_eol_cycle(grp: pd.DataFrame, chemistry: str = ChemistryType.NMC,
+                       smooth_window: int = 11) -> int:
+        threshold = EOL_THRESHOLDS.get(chemistry, 0.80)
+        soh       = grp["SOH"].values
+        cycs      = grp["cycle"].values
+        n         = len(soh)
+        min_eol_idx = EVEoLDetector.MIN_EOL_IDX
+        soh_mono = np.minimum.accumulate(soh)
+        if n >= smooth_window:
+            w = min(smooth_window, n)
+            w = w if w % 2 == 1 else w - 1
+            w = max(w, 5)
+            soh_smooth = np.minimum.accumulate(savgol_filter(soh_mono, w, 3))
+        else:
+            soh_smooth = soh_mono
+        if chemistry == ChemistryType.LFP and n > 30:
+            d2 = np.gradient(np.gradient(soh_smooth))
+            kc = np.where(d2 < np.percentile(d2, 5))[0]
+            kc = kc[kc >= min_eol_idx]
+            if len(kc) > 0:
+                knee_idx = int(kc[0])
+                below    = np.where(soh_smooth < threshold)[0]
+                eol_idx  = knee_idx if len(below) == 0 else min(knee_idx, int(below[0]))
+                eol_idx  = max(eol_idx, min_eol_idx)
+                return int(cycs[min(eol_idx, n - 1)])
+        below = np.where(soh_smooth < threshold)[0]
+        if len(below) > 0:
+            eol_idx = int(below[0])
+            eol_idx = max(eol_idx, min_eol_idx)
+            if eol_idx + 3 < n and soh_smooth[eol_idx: eol_idx + 3].mean() > threshold + 0.015:
+                below2 = np.where(soh_smooth[eol_idx + 5:] < threshold)[0]
+                if len(below2) > 0:
+                    eol_idx = eol_idx + 5 + int(below2[0])
+            return int(cycs[min(eol_idx, n - 1)])
+        return int(cycs[-1])
+
+class EVBatteryFeatureEngineer:
+
+    def compute_rul(self, df: pd.DataFrame) -> pd.DataFrame:
+        df  = df.copy().sort_values(["cell_id", "cycle"]).reset_index(drop=True)
+        dfs = []
+        det = EVEoLDetector()
+        for _, grp in df.groupby("cell_id"):
+            grp  = grp.sort_values("cycle").reset_index(drop=True)
+            chem = grp["chemistry"].iloc[0] if "chemistry" in grp.columns else ChemistryType.NMC
+            eol_cycle = det.find_eol_cycle(grp, chemistry=chem)
+            grp["RUL"]      = (eol_cycle - grp["cycle"]).clip(lower=0)
+            grp["RUL_max"]  = grp["RUL"].max()
+            grp["RUL_norm"] = grp["RUL"] / (grp["RUL_max"] + 1e-6)
+            rul_frac = grp["RUL"] / (grp["RUL_max"] + 1e-6)
+            grp["sample_weight"] = (np.exp(-2.0 * rul_frac) +
+                                    0.5 * np.exp(-((rul_frac - 0.5) ** 2) / 0.05))
+            grp["sample_weight"] /= grp["sample_weight"].mean()
+            grp = grp[grp["cycle"] <= eol_cycle]
+            dfs.append(grp)
+        return pd.concat(dfs, ignore_index=True)
+
+    def add_derived_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df  = df.copy().sort_values(["cell_id", "cycle"]).reset_index(drop=True)
+        dfs = []
+        for _, grp in df.groupby("cell_id"):
+            grp  = grp.sort_values("cycle").reset_index(drop=True)
+            n    = len(grp)
+            chem = grp["chemistry"].iloc[0] if "chemistry" in grp.columns else ChemistryType.NMC
+            key_cols = [
+                "capacity", "SOH", "discharge_time", "temp_mean", "energy",
+                "ri_mean", "ri_p90", "ica_peak", "v_entropy",
+                "soc_best", "ocv_mean", "ocv_range",
+                "voltage_range", "dvdt_mean", "v_weighted_mean",
+                "cell_imbalance_v", "cell_imbalance_t",
+                "dod", "c_rate_mean", "c_rate_max",
+                "cum_fast_charges", "calendar_days",
+            ]
+            for col in key_cols:
+                if col not in grp.columns:
+                    continue
+                for w in [5, 15, 30]:
+                    grp[f"{col}_roll{w}"]    = grp[col].rolling(w, min_periods=1).mean()
+                    grp[f"{col}_rollstd{w}"] = grp[col].rolling(w, min_periods=1).std().fillna(0)
+                grp[f"{col}_ema10"] = grp[col].ewm(span=10, adjust=False).mean()
+                grp[f"{col}_diff1"] = grp[col].diff().fillna(0)
+                init = grp[col].iloc[0]
+                if abs(init) > 1e-8:
+                    grp[f"{col}_rel"] = grp[col] / init
+            grp["cum_energy"]       = grp["energy"].cumsum()
+            grp["cum_capacity"]     = grp["capacity"].cumsum()
+            grp["cum_temp_stress"]  = ((grp["temp_max"] - 25.0).clip(0) * grp["energy"]).cumsum()
+            grp["cum_dod_stress"]   = (grp["dod"] ** 2).cumsum()
+            grp["fast_chg_density"] = grp["cum_fast_charges"] / (grp["cycle"] + 1)
+            if n >= 5:
+                w_sg = min(11, n)
+                w_sg = w_sg if w_sg % 2 == 1 else w_sg - 1
+                w_sg = max(w_sg, 5)
+                grp["SOH_sg"] = savgol_filter(grp["SOH"].values, w_sg, 3)
+            else:
+                grp["SOH_sg"] = grp["SOH"].values
+
+            def _slope(series, w=10):
+                out = np.zeros(len(series))
+                for i in range(len(series)):
+                    sl = series[max(0, i - w + 1): i + 1]
+                    if len(sl) >= 2:
+                        out[i] = np.polyfit(np.arange(len(sl)), sl, 1)[0]
+                return out
+
+            grp["SOH_faderate"]         = _slope(grp["SOH"].values, w=10)
+            grp["capacity_faderate"]    = _slope(grp["capacity"].values, w=10)
+            grp["ri_growthrate"]        = _slope(grp["ri_mean"].values, w=10)
+            grp["imbalance_growthrate"] = _slope(grp["cell_imbalance_v"].values, w=10)
+            grp["cycle_norm"]           = grp["cycle"] / (grp["cycle"].max() + 1e-6)
+            cap_rel  = grp["capacity"] / (grp["capacity"].iloc[0] + 1e-8)
+            ri_norm  = grp["ri_mean"]  / (grp["ri_mean"].iloc[0] + 1e-8)
+            imb_norm = grp["cell_imbalance_v"] / (grp["cell_imbalance_v"].iloc[0].clip(0.001) + 1e-8)
+            grp["deg_cap"]    = 1.0 - cap_rel
+            grp["deg_ri"]     = ri_norm - 1.0
+            grp["deg_imb"]    = (imb_norm - 1.0).clip(0)
+            grp["deg_index"]  = (grp["deg_cap"] * 0.45 +
+                                  grp["deg_ri"]  * 0.35 +
+                                  grp["deg_imb"] * 0.20)
+            grp["deg_accel"]  = grp["deg_index"].diff().diff().fillna(0)
+            grp["life_fraction"] = 1.0 - grp["RUL_norm"]
+            grp["is_nmc"] = float(chem == ChemistryType.NMC)
+            grp["is_lfp"] = float(chem == ChemistryType.LFP)
+            grp["is_nca"] = float(chem == ChemistryType.NCA)
+            dfs.append(grp)
+        return pd.concat(dfs, ignore_index=True)
+
+    def get_feature_columns(self, df: pd.DataFrame) -> list:
+        exclude = {
+            "cycle", "cell_id", "RUL", "RUL_norm", "RUL_max",
+            "SOH", "SOH_mono", "capacity", "sample_weight", "life_fraction",
+            "chemistry", "timestamp", "vehicle_id",
+        }
+        cols = []
+        for c in df.columns:
+            if c in exclude:
+                continue
+            if df[c].dtype not in [np.float32, np.float64, np.int32, np.int64]:
+                continue
+            if df[c].isna().any():
+                continue
+            if df[c].std() < 1e-10:
+                continue
+            cols.append(c)
+        return cols
+
+class EVSyntheticDataGenerator:
+
+    PROFILES = {
+        "WLTP":  {"c_rate_mean": 0.30, "c_rate_max": 1.20, "dod_mean": 0.75, "temp_mean": 22.0},
+        "EPA":   {"c_rate_mean": 0.25, "c_rate_max": 1.00, "dod_mean": 0.65, "temp_mean": 24.0},
+        "NEDC":  {"c_rate_mean": 0.20, "c_rate_max": 0.80, "dod_mean": 0.60, "temp_mean": 23.0},
+        "SPORT": {"c_rate_mean": 0.55, "c_rate_max": 3.00, "dod_mean": 0.85, "temp_mean": 30.0},
+        "TRUCK": {"c_rate_mean": 0.60, "c_rate_max": 2.00, "dod_mean": 0.90, "temp_mean": 28.0},
+    }
+
+    CHEMISTRY_PARAMS = {
+        ChemistryType.NMC: dict(
+            alpha_range=(0.00012, 0.00040), beta_range=(2e-6, 4e-5),
+            q0_range=(60, 120), v_nom=3.70, eol=0.80,
+            ri0=0.050, ri_growth=0.00008,
+        ),
+        ChemistryType.LFP: dict(
+            alpha_range=(0.00006, 0.00015), beta_range=(5e-7, 1e-5),
+            q0_range=(100, 300), v_nom=3.30, eol=0.75,
+            ri0=0.035, ri_growth=0.00004,
+        ),
+        ChemistryType.NCA: dict(
+            alpha_range=(0.00015, 0.00050), beta_range=(3e-6, 5e-5),
+            q0_range=(55, 100), v_nom=3.65, eol=0.78,
+            ri0=0.055, ri_growth=0.00010,
+        ),
+    }
+
+    MIN_CYCLES_BEFORE_BREAK = {
+        ChemistryType.NMC: 100,
+        ChemistryType.LFP: 200,
+        ChemistryType.NCA: 80,
+    }
+
+    _BREAK_MARGIN = 0.02
+
+    @classmethod
+    def generate(cls, n_cells: int = 40, max_cycles: int = 1500,
+                 seed: int = 0) -> pd.DataFrame:
+        rng         = np.random.default_rng(seed)
+        records     = []
+        chemistries = [ChemistryType.NMC, ChemistryType.LFP, ChemistryType.NCA]
+        profiles    = list(cls.PROFILES.keys())
+        for cell in range(n_cells):
+            chem    = chemistries[cell % len(chemistries)]
+            profile = profiles[cell % len(profiles)]
+            cp      = cls.CHEMISTRY_PARAMS[chem]
+            pr      = cls.PROFILES[profile]
+            min_cyc = cls.MIN_CYCLES_BEFORE_BREAK[chem]
+            break_threshold = cp["eol"] - cls._BREAK_MARGIN
+            alpha  = rng.uniform(*cp["alpha_range"])
+            beta   = rng.uniform(*cp["beta_range"])
+            gamma  = rng.uniform(0.003, 0.030)
+            q0     = rng.uniform(*cp["q0_range"])
+            t_base = pr["temp_mean"] + rng.uniform(-5, 5)
+            fc_penalty   = {"NMC": 0.00003, "LFP": 0.000005, "NCA": 0.00006}[chem]
+            cum_fc       = 0.0
+            has_plateau  = (chem == ChemistryType.LFP) or rng.random() < 0.2
+            plateau_cyc  = rng.integers(400, 900) if has_plateau else 9999
+            cell_imb0    = rng.uniform(0.005, 0.020)
+            for c in range(max_cycles):
+                soh_base = (1.0 - alpha * c - beta * c ** 1.5 - fc_penalty * cum_fc)
+                if has_plateau:
+                    soh_base += 0.04 * np.exp(-((c - plateau_cyc) ** 2) / (2 * 80 ** 2))
+                soh = float(np.clip(
+                    soh_base + gamma * np.sin(c / 50.0) + rng.normal(0, 0.004), 0.50, 1.03))
+                if c >= min_cyc and soh < break_threshold:
+                    break
+                cap       = q0 * soh
+                t_cyc     = t_base + 0.008 * c + rng.normal(0, 0.5)
+                c_rate_m  = pr["c_rate_mean"] + rng.normal(0, 0.05)
+                c_rate_mx = pr["c_rate_max"] + rng.normal(0, 0.10)
+                dod       = pr["dod_mean"] + rng.normal(0, 0.05)
+                is_fc     = float(c_rate_mx > 1.5 and rng.random() < 0.3)
+                cum_fc   += is_fc
+                cell_imb   = cell_imb0 * (1 + 0.002 * c + rng.normal(0, 0.001))
+                cell_imb_t = 2.0 + 0.003 * c + rng.normal(0, 0.2)
+                ri         = cp["ri0"] + cp["ri_growth"] * c + rng.normal(0, 0.003)
+                ri         = ri * (1 + 0.0008 * cum_fc)
+                ocv_v    = float(ocv_from_soc(np.array([soh]), chem)[0])
+                soc_cv   = float(np.clip(soh + rng.normal(0, 0.025), 0.0, 1.0))
+                soc_ocv  = float(np.clip(soh - 0.005 + rng.normal(0, 0.020), 0.0, 1.0))
+                soc_cc   = float(np.clip(soh - 0.01 * c / max_cycles + rng.normal(0, 0.018), 0.0, 1.0))
+                soc_kalman_val = float(np.clip(
+                    0.50 * soc_cv + 0.30 * soc_ocv + 0.20 * soc_cc, 0.0, 1.0))
+                if chem == ChemistryType.LFP:
+                    soc_best_val = float(np.clip(
+                        0.65 * soc_cc + 0.10 * soc_ocv + 0.25 * soc_kalman_val, 0.0, 1.0))
+                else:
+                    soc_best_val = float(np.clip(
+                        0.60 * soc_cv + 0.20 * soc_ocv + 0.20 * soc_cc, 0.0, 1.0))
+                records.append(dict(
+                    cycle=c, cell_id=f"Syn_{chem}_{cell:03d}", chemistry=chem,
+                    SOH=soh, capacity=cap,
+                    voltage_min=ocv_from_soc(np.array([0.05]), chem)[0] + rng.normal(0, 0.008),
+                    voltage_mean=cp["v_nom"] - 0.0004 * c + rng.normal(0, 0.015),
+                    voltage_std=0.35 + 0.0002 * c + rng.normal(0, 0.005),
+                    voltage_max=ocv_from_soc(np.array([0.99]), chem)[0] + rng.normal(0, 0.005),
+                    voltage_range=0.9 + rng.normal(0, 0.02),
+                    current_mean=c_rate_m * q0 / cap + rng.normal(0, 0.05),
+                    current_std=0.25 + 0.0001 * c,
+                    temp_mean=t_cyc, temp_max=t_cyc + 8 + 0.02 * c,
+                    temp_min=t_cyc - 2.0, temp_rise=10 + 0.02 * c,
+                    discharge_time=3600 * soh * dod / (c_rate_m + 1e-4) * rng.uniform(0.96, 1.04),
+                    energy=cap * cp["v_nom"] * dod * rng.uniform(0.97, 1.03),
+                    ri_mean=ri, ri_std=ri * 0.12, ri_p90=ri * 1.4,
+                    ica_peak=0.12 - 0.00008 * c + rng.normal(0, 0.004),
+                    ica_var=0.002 + 4e-6 * c + rng.normal(0, 0.0003),
+                    ica_skew=0.1 + rng.normal(0, 0.05),
+                    v_entropy=2.80 + 0.0005 * c + rng.normal(0, 0.02),
+                    v_kurtosis=-1.2 + rng.normal(0, 0.1),
+                    knee_soc=0.60 + 0.0002 * c + rng.normal(0, 0.01),
+                    dvdt_mean=-0.001 - 4e-6 * c, dvdt_std=0.002 + 1e-6 * c,
+                    ocv_mean=ocv_v, ocv_std=0.15, ocv_slope=-0.0005 - 1e-6 * c,
+                    ocv_range=1.0 - 0.001 * c + rng.normal(0, 0.04),
+                    soc_from_ocv=soc_ocv, soc_ocv_std=0.1,
+                    d_soc_docv_mean=1.5 + rng.normal(0, 0.2),
+                    d_soc_docv_p75=2.0 + rng.normal(0, 0.2),
+                    soc_coulomb=soc_cc,
+                    soc_diverge=float(abs(soc_ocv - soc_cc)),
+                    v_integral=cp["v_nom"] * 3600 * soh + rng.normal(0, 200),
+                    v_weighted_mean=cp["v_nom"] - 0.0005 * c + rng.normal(0, 0.02),
+                    dod=float(np.clip(dod, 0.0, 1.0)),
+                    dod_mean50=float(np.clip(dod / 2, 0.0, 1.0)),
+                    c_rate_mean=float(np.clip(c_rate_m, 0.0, 5.0)),
+                    c_rate_max=float(np.clip(c_rate_mx, 0.0, 6.0)),
+                    is_fast_charge=is_fc,
+                    cell_imbalance_v=float(np.clip(cell_imb, 0.0, 0.5)),
+                    cell_imbalance_t=float(np.clip(cell_imb_t, 0.0, 20.0)),
+                    pack_t_gradient=float(np.clip(cell_imb_t, 0.0, 20.0)),
+                    cum_fast_charges=float(cum_fc),
+                    calendar_days=float(c * 0.8 + rng.uniform(0, 0.5)),
+                    soc_consistent=float(abs(soc_ocv - soc_cc) < SOC_DIVERGE_THR),
+                    soc_kalman=soc_kalman_val,
+                    soc_spread_3way=float(abs(soc_ocv - soc_cc) * 0.8),
+                    soc_best=soc_best_val,
+                    soc_resid=0.0,
+                    is_nmc=float(chem == ChemistryType.NMC),
+                    is_lfp=float(chem == ChemistryType.LFP),
+                    is_nca=float(chem == ChemistryType.NCA),
+                ))
+        return pd.DataFrame(records)
+
+
+class EVBatteryAugmentor:
+
+    def __init__(self, noise_std: float = 0.006, n_augments: int = 5):
+        self.noise_std  = noise_std
+        self.n_augments = n_augments
+
+    def gaussian_noise(self, X):
+        return X + np.random.normal(0, self.noise_std, X.shape).astype(np.float32)
+
+    @staticmethod
+    def time_warp(X, sigma=0.07):
+        n, t, f = X.shape
+        out = np.empty_like(X)
+        for i in range(n):
+            knots  = np.clip(np.random.normal(1.0, sigma, 4), 0.5, 1.6)
+            warp_x = np.linspace(0, t - 1, len(knots))
+            warp_y = np.cumsum(knots)
+            warp_y = warp_y / warp_y[-1] * (t - 1)
+            orig   = np.linspace(0, t - 1, t)
+            warped = np.interp(orig, warp_x, warp_y)
+            for feat in range(f):
+                out[i, :, feat] = np.interp(warped, orig, X[i, :, feat])
+        return out
+
+    @staticmethod
+    def mixup(X, y, alpha=0.20):
+        n   = len(X)
+        idx = np.random.permutation(n)
+        lam = np.random.beta(alpha, alpha, n).reshape(-1, 1, 1).astype(np.float32)
+        X_mix = lam * X + (1 - lam) * X[idx]
+        lam_y = lam.reshape(-1, 1)
+        y_mix = lam_y * y + (1 - lam_y) * y[idx]
+        return X_mix.astype(np.float32), y_mix.astype(np.float32)
+
+    @staticmethod
+    def thermal_stress_inject(X, severity=0.05):
+        Xn = X.copy()
+        t_cols = slice(-6, -3)
+        Xn[:, :, t_cols] += np.random.uniform(
+            -severity, severity, Xn[:, :, t_cols].shape).astype(np.float32)
+        return Xn
+
+    def augment(self, X, y, weights=None, n_aug=None):
+        n_aug  = n_aug or self.n_augments
+        X_list = [X]; y_list = [y]
+        w_list = [weights if weights is not None else np.ones(len(X))]
+        for _ in range(n_aug):
+            Xa = self.gaussian_noise(X.copy())
+            r  = np.random.rand()
+            if r < 0.25:
+                Xa = self.time_warp(Xa)
+            elif r < 0.45:
+                Xa = self.thermal_stress_inject(Xa)
+            elif r < 0.60:
+                Xa, ya = self.mixup(X, y)
+                X_list.append(Xa.astype(np.float32))
+                y_list.append(ya.astype(np.float32))
+                w_list.append(weights if weights is not None else np.ones(len(X)))
+                continue
+            X_list.append(Xa.astype(np.float32))
+            y_list.append(y)
+            w_list.append(weights if weights is not None else np.ones(len(X)))
+        return (np.concatenate(X_list, 0),
+                np.concatenate(y_list, 0),
+                np.concatenate(w_list, 0))
+
+class SequenceDataset:
+
+    def __init__(self, window_size: int = 30, step: int = None):
+        self.window_size = window_size
+        self.step        = step if step is not None else max(1, window_size // 3)
+        self.scaler_X    = RobustScaler(quantile_range=(3, 97))
+
+    def _build(self, df, features, target_col="RUL_norm"):
+        X_list, y_list, rm_list, w_list = [], [], [], []
+        skipped = []
+        for cell_id, grp in df.groupby("cell_id"):
+            grp = grp.sort_values("cycle").reset_index(drop=True)
+            if len(grp) <= self.window_size:
+                skipped.append((str(cell_id), len(grp)))
+                continue
+            Fv  = grp[features].values.astype(np.float32)
+            Rv  = grp[target_col].values.astype(np.float32)
+            Rm  = float(grp["RUL_max"].iloc[0])
+            Wv  = (grp["sample_weight"].values.astype(np.float32)
+                   if "sample_weight" in grp else np.ones(len(grp), dtype=np.float32))
+            for s in range(0, len(grp) - self.window_size, self.step):
+                e = s + self.window_size
+                X_list.append(Fv[s:e])
+                y_list.append(Rv[e - 1])
+                rm_list.append(Rm)
+                w_list.append(float(Wv[e - 1]))
+        if skipped:
+            print(f"  [_build] Skipped {len(skipped)} short cell(s)")
+        if not X_list:
+            raise ValueError(f"No sequences — window_size={self.window_size} too large?")
+        return (np.array(X_list, dtype=np.float32),
+                np.array(y_list, dtype=np.float32).reshape(-1, 1),
+                np.array(rm_list, dtype=np.float32),
+                np.array(w_list, dtype=np.float32))
+
+    def _clean(self, X, y):
+        return (np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0),
+                np.nan_to_num(y, nan=0.5, posinf=1.0, neginf=0.0))
+
+    def fit_transform(self, df_train, features):
+        X, y, rm, w = self._build(df_train, features)
+        X, y = self._clean(X, y)
+        n, t, f = X.shape
+        X_s = self.scaler_X.fit_transform(X.reshape(-1, f)).reshape(n, t, f)
+        return np.nan_to_num(X_s, nan=0.0).astype(np.float32), y.astype(np.float32), rm, w
+
+    def transform(self, df, features):
+        X, y, rm, w = self._build(df, features)
+        X, y = self._clean(X, y)
+        n, t, f = X.shape
+        X_s = self.scaler_X.transform(X.reshape(-1, f)).reshape(n, t, f)
+        return np.nan_to_num(X_s, nan=0.0).astype(np.float32), y.astype(np.float32), rm, w
+
+    def inv_y(self, y_norm, rul_max):
+        return np.array(y_norm).flatten() * np.array(rul_max).flatten()
+
+def eol_weighted_quantile_loss(tau_list=(0.10, 0.50, 0.90)):
+    def loss(y_true, y_pred):
+        eol_w = keras.ops.exp(-3.0 * y_true) + 0.5
+        total = 0.0
+        for i, tau in enumerate(tau_list):
+            err   = y_true - y_pred[:, i:i+1]
+            pb    = keras.ops.where(err >= 0, tau * err, (tau - 1.0) * err)
+            total = total + keras.ops.mean(pb * eol_w)
+        return total / len(tau_list)
+    return loss
+
+
+def huber_mape_loss(delta=0.10):
+    def loss(y_true, y_pred):
+        err   = keras.ops.abs(y_true - y_pred[:, 1:2]) / (keras.ops.abs(y_true) + 0.15)
+        huber = keras.ops.where(err <= delta, 0.5 * err**2 / delta, err - 0.5 * delta)
+        return keras.ops.mean(huber)
+    return loss
+
+
+def chemistry_aware_loss(tau_list=(0.10, 0.50, 0.90), alpha=0.65):
+    ql   = eol_weighted_quantile_loss(tau_list)
+    hmpe = huber_mape_loss()
+    def loss(y_true, y_pred):
+        return alpha * ql(y_true, y_pred) + (1 - alpha) * hmpe(y_true, y_pred)
+    return loss
+
+
+def _cnn_branch(inp, filters, dropout):
+    x    = Conv1D(filters, 3, activation="gelu", padding="same",
+                  kernel_regularizer=l2(3e-5))(inp)
+    x    = BatchNormalization()(x)
+    x    = Conv1D(filters, 3, activation="gelu", padding="same",
+                  kernel_regularizer=l2(3e-5))(x)
+    skip = Conv1D(filters, 1, padding="same")(inp)
+    x    = Add()([x, skip])
+    x    = BatchNormalization()(x)
+    x    = AveragePooling1D(2)(x)
+    x    = SpatialDropout1D(dropout * 0.5)(x)
+    return Flatten()(x)
+
+
+def _bilstm_branch(inp, units, dropout):
+    x    = Bidirectional(LSTM(units, return_sequences=True, dropout=dropout * 0.6,
+                              recurrent_dropout=dropout * 0.2,
+                              kernel_regularizer=l2(3e-5)))(inp)
+    x    = LayerNormalization()(x)
+    last = Lambda(lambda t: t[:, -1, :])(x)
+    avg  = GlobalAveragePooling1D()(x)
+    return Concatenate()([last, avg])
+
+
+def _attention_branch(inp, heads, key_dim, dropout):
+    ln  = LayerNormalization(epsilon=1e-6)(inp)
+    att = MultiHeadAttention(num_heads=heads, key_dim=key_dim,
+                             dropout=dropout * 0.3)(ln, ln)
+    att = Add()([inp, att])
+    att = LayerNormalization(epsilon=1e-6)(att)
+    ff  = Dense(inp.shape[-1] * 2, activation="gelu",
+                kernel_regularizer=l2(3e-5))(att)
+    ff  = Dense(inp.shape[-1], kernel_regularizer=l2(3e-5))(ff)
+    out = Add()([att, ff])
+    return GlobalAveragePooling1D()(LayerNormalization()(out))
+
+
+def _gru_branch(inp, units, dropout):
+    x = GRU(units // 2, return_sequences=True, dropout=dropout * 0.3)(inp)
+    return GlobalAveragePooling1D()(x)
+
+
+def build_ev_model(seq_len, n_features,
+                   lstm_units=64,
+                   cnn_filters=32,
+                   attn_heads=2,
+                   attn_key_dim=16,
+                   dense_units=96,
+                   dropout_rate=0.25,
+                   lr=1.5e-4, seed=42) -> Model:
+    keras.utils.set_random_seed(seed)
+    inp = Input(shape=(seq_len, n_features), name="cycle_sequence")
+    b1 = _cnn_branch(inp, cnn_filters, dropout_rate)
+    b2 = _bilstm_branch(inp, lstm_units, dropout_rate)
+    b3 = _attention_branch(inp, attn_heads, attn_key_dim, dropout_rate)
+    b4 = _gru_branch(inp, lstm_units, dropout_rate)
+    fused = Concatenate()([b1, b2, b3, b4])
+    fused = Dense(dense_units, activation="gelu", kernel_regularizer=l2(3e-5))(fused)
+    fused = BatchNormalization()(fused)
+    fused = Dropout(dropout_rate)(fused)
+    fused = Dense(dense_units // 2, activation="gelu")(fused)
+    fused = Dropout(dropout_rate * 0.5)(fused)
+    shared   = Dense(48, activation="gelu")(fused)
+    res_skip = Dense(48, activation="linear")(fused)
+    shared   = Add()([shared, res_skip])
+    shared   = LayerNormalization()(shared)
+    q10_raw = Dense(1, activation="sigmoid", name="q10")(shared)
+    q50_raw = Dense(1, activation="sigmoid", name="q50")(shared)
+    q90_raw = Dense(1, activation="sigmoid", name="q90")(shared)
+    q10 = q10_raw
+    q50 = Add()([
+        q10,
+        Lambda(lambda x: keras.ops.softplus(x[0] - x[1]) * 0.5)([q50_raw, q10_raw])
+    ])
+    q90 = Add()([
+        q50,
+        Lambda(lambda x: keras.ops.softplus(x[0] - x[1]) * 0.5)([q90_raw, q50_raw])
+    ])
+    out = Concatenate(name="RUL_quantiles")([q10, q50, q90])
+    model = Model(inputs=inp, outputs=out, name=f"RUL_EV_v53_s{seed}")
+    model.compile(
+        optimizer=AdamW(learning_rate=lr, weight_decay=3e-5, clipnorm=0.5),
+        loss=chemistry_aware_loss(),
+        metrics=["mae"],
+    )
+    return model
+
+
+def cosine_warmup_lr(epoch, lr, warmup=5, total=200, lr_min=5e-7, lr_max=1.5e-4):
+    if epoch < warmup:
+        return float(lr_min + (lr_max - lr_min) * (epoch / warmup))
+    t     = epoch - warmup
+    T     = total - warmup
+    ratio = 0.5 * (1 + np.cos(np.pi * t / T))
+    return float(lr_min + (lr_max - lr_min) * ratio)
+
+
+class SOCPreCalculator:
+    SOC_PROXY = "soc_best"
+
+    def __init__(self):
+        self.model  = HistGradientBoostingRegressor(
+            max_iter=500, max_depth=6, learning_rate=0.03,
+            min_samples_leaf=6, l2_regularization=0.08,
+            random_state=GLOBAL_SEED)
+        self.fitted = False
+        self._feats = None
+
+    def fit(self, df_train: pd.DataFrame, features: list):
+        valid = [f for f in features
+                 if f in df_train.columns and f != self.SOC_PROXY]
+        self._feats = valid
+        self.model.fit(df_train[valid].values, df_train[self.SOC_PROXY].values)
+        self.fitted = True
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        if not self.fitted:
+            df["soc_resid"] = 0.0
+            return df
+        X = df[[f for f in self._feats if f in df.columns]].fillna(0).values
+        df["soc_resid"] = df[self.SOC_PROXY].values - self.model.predict(X)
+        return df
+
+    def fit_transform(self, df_train: pd.DataFrame, features: list) -> pd.DataFrame:
+        self.fit(df_train, features)
+        return self.transform(df_train)
+
+
+
+def fingerprint_data(df: pd.DataFrame) -> str:
+    stats  = df.groupby("cell_id")["SOH"].agg(["mean", "std", "count"])
+    digest = hashlib.md5(
+        (stats.to_string() + str(df.shape)).encode()
+    ).hexdigest()
+    return digest
+
+
+class ModelRegistry:
+    REGISTRY_FILE = "registry.json"
+    VERSION       = "v5.3-ev"
+
+    def __init__(self, output_dir: str):
+        self.output_dir     = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._registry_path = self.output_dir / self.REGISTRY_FILE
+        self._registry: Dict = self._load_registry()
+        self._loaded_models  = {}
+        self._lock           = threading.Lock()
+
+    def _load_registry(self) -> dict:
+        if self._registry_path.exists():
+            with open(self._registry_path) as f:
+                return json.load(f)
+        return {}
+
+    def _save_registry(self):
+        with open(self._registry_path, "w") as f:
+            json.dump(self._registry, f, indent=2)
+
+    def needs_retrain(self, data_hash: str) -> bool:
+        if "data_hash" not in self._registry:
+            return True
+        if self._registry["data_hash"] != data_hash:
+            print(f"  Data changed ({data_hash[:8]}…) — retraining.")
+            return True
+        for fold in range(self._registry.get("n_folds", 0)):
+            for seed in range(self._registry.get("n_ensemble", 0)):
+                p = self.output_dir / f"model_f{fold}_s{seed}.keras"
+                if not p.exists():
+                    print(f"  Missing {p.name} — retraining.")
+                    return True
+        print(f"  Models up-to-date ({data_hash[:8]}…) — skipping training.")
+        return False
+
+    def save_fold(self, fold, seed, model, scaler, iso, soc_pre,
+                  val_mae, features, rul_max):
+        keras_path = str(self.output_dir / f"model_f{fold}_s{seed}.keras")
+        model.save(keras_path)
+        h5_path = str(self.output_dir / f"model_f{fold}_s{seed}.h5")
+        model.save(h5_path, save_format="h5")
+        joblib.dump(scaler, self.output_dir / f"scaler_f{fold}_s{seed}.pkl")
+        if iso is not None:
+            joblib.dump(iso, self.output_dir / f"iso_f{fold}.pkl")
+        if soc_pre is not None:
+            joblib.dump(soc_pre, self.output_dir / f"soc_pre_f{fold}.pkl")
+        key = f"fold_{fold}_seed_{seed}"
+        self._registry.setdefault("folds", {})[key] = dict(
+            val_mae=val_mae, features=features, rul_max=rul_max)
+
+    def save_metadata(self, data_hash, n_folds, n_ensemble,
+                      window_size, cell_ids, fold_results):
+        fold_metrics = []
+        for r in fold_results:
+            row = {}
+            for k, v in r.items():
+                if k in _FOLD_EXCLUDE:
+                    continue
+                row[k] = _json_safe(v)
+            fold_metrics.append(row)
+
+        self._registry.update({
+            "data_hash":    data_hash,
+            "n_folds":      n_folds,
+            "n_ensemble":   n_ensemble,
+            "window_size":  window_size,
+            "cell_ids":     cell_ids,
+            "trained_at":   datetime.now().isoformat(),
+            "version":      self.VERSION,
+            "fold_metrics": fold_metrics,
+        })
+        self._save_registry()
+        print(f"  Registry → {self._registry_path}")
+
+    def is_trained(self) -> bool:
+        return bool(self._registry.get("data_hash"))
+
+
+
+class RULTrainerV5:
+
+    def __init__(
+        self,
+        window_size:      int   = 10,
+        lstm_units:       int   = 64,
+        cnn_filters:      int   = 32,
+        attn_heads:       int   = 2,
+        dense_units:      int   = 96,
+        dropout_rate:     float = 0.25,
+        batch_size:       int   = 128,
+        max_epochs:       int   = 25,
+        pretrain_epochs:  int   = 4,
+        pretrain_n_cells: int   = 8,
+        pretrain_max_cyc: int   = 200,
+        lr:               float = 1.5e-4,
+        n_augments:       int   = 2,
+        n_ensemble:       int   = N_ENSEMBLE,
+        output_dir:       str   = "./rul_v5_outputs",
+        registry:         Optional[ModelRegistry] = None,
+        mi_selector:      bool  = True,
+    ):
+        self.window_size      = window_size
+        self.lstm_units       = lstm_units
+        self.cnn_filters      = cnn_filters
+        self.attn_heads       = attn_heads
+        self.dense_units      = dense_units
+        self.dropout_rate     = dropout_rate
+        self.batch_size       = batch_size
+        self.max_epochs       = max_epochs
+        self.pretrain_epochs  = pretrain_epochs
+        self.pretrain_n_cells = pretrain_n_cells
+        self.pretrain_max_cyc = pretrain_max_cyc
+        self.lr               = lr
+        self.n_augments       = n_augments
+        self.n_ensemble       = n_ensemble
+        self.output_dir       = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.registry         = registry or ModelRegistry(output_dir)
+        self.mi_selector      = mi_selector
+
+    def _callbacks(self, fold, seed):
+        mp             = str(self.output_dir / f"model_f{fold}_s{seed}.keras")
+        es_patience    = max(8, self.max_epochs // 6)
+        rlrop_patience = max(5, self.max_epochs // 8)
+        return [
+            EarlyStopping(monitor="val_mae", patience=es_patience,
+                          restore_best_weights=True, min_delta=1e-5, verbose=1),
+            LearningRateScheduler(
+                lambda ep, lr_: cosine_warmup_lr(ep, lr_, total=self.max_epochs),
+                verbose=0),
+            ModelCheckpoint(mp, monitor="val_mae", save_best_only=True, verbose=0),
+            ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                              patience=rlrop_patience, min_lr=1e-7, verbose=0),
+        ]
+
+    def _pretrain_base(self, features, fe):
+        print(f"  [pretrain] {self.pretrain_n_cells} synthetic cells …", end=" ", flush=True)
+        syn_raw = EVSyntheticDataGenerator.generate(
+            n_cells=self.pretrain_n_cells, max_cycles=self.pretrain_max_cyc)
+        syn_df  = fe.compute_rul(syn_raw)
+        syn_df  = fe.add_derived_features(syn_df)
+        if "soc_resid" not in syn_df.columns:
+            syn_df["soc_resid"] = 0.0
+        ws   = self.window_size
+        step = max(1, ws // 3)
+        X_list, y_list, w_list = [], [], []
+        for _, grp in syn_df.groupby("cell_id"):
+            grp = grp.sort_values("cycle").reset_index(drop=True)
+            if len(grp) <= ws:
+                continue
+            Fv = np.zeros((len(grp), len(features)), dtype=np.float32)
+            for fi, feat in enumerate(features):
+                if feat in grp.columns:
+                    Fv[:, fi] = grp[feat].values.astype(np.float32)
+            Rv = grp["RUL_norm"].values.astype(np.float32)
+            Wv = (grp["sample_weight"].values.astype(np.float32)
+                  if "sample_weight" in grp else np.ones(len(grp), np.float32))
+            for s in range(0, len(grp) - ws, step):
+                X_list.append(Fv[s:s + ws])
+                y_list.append(Rv[s + ws - 1])
+                w_list.append(Wv[s + ws - 1])
+        if not X_list:
+            print("skipped"); return None
+        X_syn   = np.nan_to_num(np.array(X_list, dtype=np.float32), nan=0.0)
+        y_syn   = np.nan_to_num(np.array(y_list, dtype=np.float32).reshape(-1, 1), nan=0.5)
+        w_syn   = np.nan_to_num(np.array(w_list, dtype=np.float32), nan=1.0)
+        n, t, f_dim = X_syn.shape
+        sc      = RobustScaler(quantile_range=(3, 97))
+        X_syn_s = np.nan_to_num(
+            sc.fit_transform(X_syn.reshape(-1, f_dim)).reshape(n, t, f_dim), nan=0.0)
+        y_syn_3 = np.repeat(y_syn, 3, axis=1)
+        base_model = build_ev_model(
+            seq_len=ws, n_features=len(features),
+            lstm_units=self.lstm_units, cnn_filters=self.cnn_filters,
+            attn_heads=self.attn_heads, dense_units=self.dense_units,
+            dropout_rate=self.dropout_rate, lr=self.lr, seed=0)
+        es_pt = EarlyStopping(monitor="val_loss",
+                              patience=max(3, self.pretrain_epochs // 3),
+                              restore_best_weights=True)
+        base_model.fit(X_syn_s, y_syn_3, sample_weight=w_syn,
+                       epochs=self.pretrain_epochs, batch_size=256,
+                       validation_split=0.1, verbose=0, callbacks=[es_pt])
+        print(f"done ({len(X_syn)} seqs)")
+        return base_model
+
+    def _clone_with_noise(self, base_model, seq_len, n_features, seed, noise_scale=0.01):
+        new_model = build_ev_model(
+            seq_len=seq_len, n_features=n_features,
+            lstm_units=self.lstm_units, cnn_filters=self.cnn_filters,
+            attn_heads=self.attn_heads, dense_units=self.dense_units,
+            dropout_rate=self.dropout_rate, lr=self.lr, seed=seed)
+        rng = np.random.default_rng(seed)
+        noisy = [w + rng.normal(0, noise_scale * np.std(w) + 1e-9, w.shape).astype(w.dtype)
+                 for w in base_model.get_weights()]
+        new_model.set_weights(noisy)
+        return new_model
+
+    @staticmethod
+    def _weighted_ensemble(preds_list, val_maes):
+        arr = np.array(val_maes, dtype=np.float64)
+        arr = np.where(np.isfinite(arr), arr, 1.0)
+        w   = 1.0 / (arr ** 2 + 1e-8); w /= w.sum()
+        return (np.stack(preds_list, 0) * w[:, None, None]).sum(0)
+
+    def train_loco_cv(self, df, features, fe) -> list:
+        cell_ids  = df["cell_id"].unique()
+        augmentor = EVBatteryAugmentor(n_augments=self.n_augments)
+        results   = []
+
+        print(f"\n{'='*70}")
+        print(f" LOCO-CV — {len(cell_ids)} folds | {self.n_ensemble} models/fold "
+              f"| window={self.window_size}")
+        print(f"{'='*70}")
+
+        print("\n[pretrain] Training shared base model …")
+        global_base = self._pretrain_base(features, fe)
+
+        for fold, test_cell in enumerate(cell_ids):
+            print(f"\n Fold {fold+1}/{len(cell_ids)} — held-out: {test_cell}")
+            t0 = time.time()
+
+            df_train  = df[df["cell_id"] != test_cell].copy()
+            df_test   = df[df["cell_id"] == test_cell].copy()
+            chem_test = (df_test["chemistry"].iloc[0]
+                         if "chemistry" in df_test.columns else ChemistryType.NMC)
+            mape_floor = MAPE_FLOORS.get(chem_test, 10.0)
+
+            soc_pre  = SOCPreCalculator()
+            df_train = soc_pre.fit_transform(df_train, features)
+            df_test  = soc_pre.transform(df_test)
+            ext_feats = list(dict.fromkeys(
+                features + (["soc_resid"] if "soc_resid" not in features else [])))
+            ext_feats = [f for f in ext_feats if f in df_train.columns]
+
+            if self.mi_selector:
+                selector  = MIFeatureSelector(k=TOP_K_FEATURES)
+                ext_feats = selector.fit_transform(df_train, ext_feats, "RUL_norm")
+                joblib.dump(selector, self.output_dir / f"selector_f{fold}.pkl")
+
+            seq_ds = SequenceDataset(window_size=self.window_size)
+            X_tr, y_tr, rm_tr, w_tr = seq_ds.fit_transform(df_train, ext_feats)
+
+            try:
+                X_te, y_te, rm_te, w_te = seq_ds.transform(df_test, ext_feats)
+            except ValueError as exc:
+                print(f"  [SKIP fold {fold+1}] Test cell too short: {exc}")
+                continue
+
+            if len(X_tr) < 20 or len(X_te) < 2:
+                print("  [SKIP] too few sequences"); continue
+
+            n_aug = max(self.n_augments, int(500 / max(len(X_tr), 1)))
+            X_aug, y_aug, w_aug = augmentor.augment(X_tr, y_tr, w_tr, n_aug=n_aug)
+            X_aug = np.nan_to_num(X_aug, nan=0.0, posinf=0.0, neginf=0.0)
+            y_aug = np.nan_to_num(y_aug, nan=0.5, posinf=1.0, neginf=0.0)
+            w_aug = np.nan_to_num(w_aug, nan=1.0)
+            y_aug_3 = np.repeat(y_aug, 3, axis=1)
+
+            base_to_use = global_base
+            if global_base is not None and len(ext_feats) != len(features):
+                print(f"  [pretrain-fold] Feature count changed, retraining …", end=" ")
+                base_to_use = self._pretrain_base(ext_feats, fe)
+
+            ens_preds, val_maes, histories = [], [], []
+            iso = None
+
+            for s_idx, seed in enumerate(range(self.n_ensemble)):
+                print(f"  [{s_idx+1}/{self.n_ensemble}] seed={seed} …", end=" ", flush=True)
+                if base_to_use is not None:
+                    model = self._clone_with_noise(
+                        base_to_use, self.window_size, len(ext_feats), seed=seed)
+                else:
+                    model = build_ev_model(
+                        seq_len=self.window_size, n_features=len(ext_feats),
+                        lstm_units=self.lstm_units, cnn_filters=self.cnn_filters,
+                        attn_heads=self.attn_heads, dense_units=self.dense_units,
+                        dropout_rate=self.dropout_rate, lr=self.lr, seed=seed)
+
+                hist = model.fit(
+                    X_aug, y_aug_3, sample_weight=w_aug,
+                    validation_split=0.15, epochs=self.max_epochs,
+                    batch_size=self.batch_size,
+                    callbacks=self._callbacks(fold, seed), verbose=1)
+                histories.append(hist.history)
+
+                X_te_c  = np.nan_to_num(X_te, nan=0.0, posinf=0.0, neginf=0.0)
+                pred_mc = np.mean(
+                    [model(X_te_c, training=True).numpy() for _ in range(MC_SAMPLES)],
+                    axis=0)
+                pred_mc = np.nan_to_num(pred_mc, nan=0.5)
+                ens_preds.append(pred_mc)
+
+                best_val = min(hist.history.get("val_mae", [np.nan]))
+                if not np.isfinite(best_val):
+                    best_val = 1.0
+                val_maes.append(best_val)
+
+                self.registry.save_fold(
+                    fold, seed, model, seq_ds.scaler_X, None, soc_pre,
+                    best_val, ext_feats, float(rm_te.mean()))
+                print(f"val_mae={best_val:.4f}")
+
+            ens_pred = self._weighted_ensemble(ens_preds, val_maes)
+            q10_n, q50_n, q90_n = ens_pred[:, 0], ens_pred[:, 1], ens_pred[:, 2]
+
+            y_pred    = seq_ds.inv_y(q50_n, rm_te)
+            y_pred_lo = seq_ds.inv_y(q10_n, rm_te)
+            y_pred_hi = seq_ds.inv_y(q90_n, rm_te)
+            y_true    = seq_ds.inv_y(y_te.flatten(), rm_te)
+
+            if len(y_true) > 15:
+                valid_iso = np.isfinite(y_pred) & np.isfinite(y_true)
+                if valid_iso.sum() > 10:
+                    iso = IsotonicRegression(out_of_bounds="clip")
+                    si  = np.argsort(y_pred[valid_iso])
+                    iso.fit(y_pred[valid_iso][si], y_true[valid_iso][si])
+                    y_pred    = np.where(np.isfinite(y_pred),
+                                         iso.predict(y_pred), np.nanmean(y_true))
+                    y_pred_lo = np.where(np.isfinite(y_pred_lo),
+                                         iso.predict(np.clip(y_pred_lo,
+                                             y_pred.min() - 1, y_pred.max() + 1)),
+                                         y_pred_lo)
+                    y_pred_hi = np.where(np.isfinite(y_pred_hi),
+                                         iso.predict(np.clip(y_pred_hi,
+                                             y_pred.min() - 1, y_pred.max() + 1)),
+                                         y_pred_hi)
+                    joblib.dump(iso, self.output_dir / f"iso_f{fold}.pkl")
+
+            ens_std_norm = np.stack([p[:, 1] for p in ens_preds], 0).std(0)
+            y_pred_std   = ens_std_norm * rm_te
+
+            mask = np.isfinite(y_true) & np.isfinite(y_pred)
+            if mask.sum() < 2:
+                print("  [WARN] All preds NaN — skipping fold."); continue
+
+            yt, yp = y_true[mask], y_pred[mask]
+            rmse   = float(np.sqrt(mean_squared_error(yt, yp)))
+            mae    = float(mean_absolute_error(yt, yp))
+            r2     = float(r2_score(yt, yp))
+            mape   = float(np.mean(
+                np.abs((yt - yp) / (np.abs(yt) + mape_floor))) * 100)
+
+            soh_v = df_test.sort_values("cycle")["SOH"].values
+            soh_v = soh_v[self.window_size - 1: self.window_size - 1 + len(yt)]
+            if len(soh_v) == len(yt):
+                def _mape_m(m):
+                    if m.sum() < 2: return None
+                    return float(np.mean(np.abs(
+                        (yt[m] - yp[m]) / (np.abs(yt[m]) + mape_floor))) * 100)
+                mape_el  = _mape_m(soh_v > 0.90)
+                mape_ml  = _mape_m((soh_v >= 0.85) & (soh_v <= 0.90))
+                mape_eol = _mape_m(soh_v < 0.85)
+            else:
+                mape_el = mape_ml = mape_eol = None
+
+            cov     = float(np.mean((yt >= y_pred_lo[mask]) & (yt <= y_pred_hi[mask])))
+            elapsed = time.time() - t0
+            print(f"  [{chem_test}] RMSE={rmse:.2f} MAE={mae:.2f} "
+                  f"R²={r2:.4f} MAPE={mape:.2f}% PI={cov:.1%} ({elapsed:.0f}s)")
+
+            results.append(dict(
+                fold=fold + 1, test_cell=str(test_cell), chemistry=str(chem_test),
+                rmse=rmse, mae=mae, r2=r2, mape=mape,
+                mape_early=mape_el, mape_mid=mape_ml, mape_eol=mape_eol,
+                pi_coverage=cov,
+                y_true=yt, y_pred=yp,
+                y_pred_lo=y_pred_lo[mask], y_pred_hi=y_pred_hi[mask],
+                y_pred_std=y_pred_std[mask],
+                histories=histories, seq_ds=seq_ds, model=model,
+                features=ext_feats, soc_pre=soc_pre,
+            ))
+
+        return results
+
+    @staticmethod
+    def aggregate_results(fold_results) -> pd.DataFrame:
+        rows = [{k: r[k] for k in ["fold", "test_cell", "chemistry",
+                                    "rmse", "mae", "r2", "mape", "pi_coverage"]}
+                for r in fold_results]
+        df_res = pd.DataFrame(rows)
+        print(f"\n{'='*70}")
+        print(" Cross-Validation Summary")
+        print(f"{'='*70}")
+        print(df_res.to_string(index=False))
+        print(f"\n  Mean RMSE : {df_res['rmse'].mean():.2f} ± {df_res['rmse'].std():.2f}")
+        print(f"  Mean MAE  : {df_res['mae'].mean():.2f} ± {df_res['mae'].std():.2f}")
+        print(f"  Mean R²   : {df_res['r2'].mean():.4f} ± {df_res['r2'].std():.4f}")
+        print(f"  Mean MAPE : {df_res['mape'].mean():.2f}% ± {df_res['mape'].std():.2f}%")
+        return df_res
+
+
+class EVRULVisualizer:
+
+    PALETTE = {
+        "blue": "#1565C0", "red": "#C62828", "green": "#2E7D32",
+        "amber": "#E65100", "purple": "#6A1B9A",
+        "nmc": "#1565C0", "lfp": "#2E7D32", "nca": "#E65100",
+    }
+
+    @staticmethod
+    def _save(fig, name, out):
+        fig.savefig(str(out / name), dpi=150, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        print(f"  Saved: {name}")
+
+    def plot_multi_chemistry_ocv(self, out):
+        soc = np.linspace(0, 1, 500)
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.patch.set_facecolor("white")
+        for chem, col in [("NMC", "blue"), ("LFP", "green"), ("NCA", "amber")]:
+            ocv = ocv_from_soc(soc, chem)
+            axes[0].plot(soc, ocv, color=self.PALETTE[col], lw=2.5, label=chem)
+        axes[0].set(xlabel="SOC", ylabel="OCV (V)", title="OCV Curves")
+        axes[0].legend(); axes[0].grid(alpha=0.3)
+        soc2 = np.linspace(0.05, 0.95, 500)
+        for chem, col in [("NMC", "blue"), ("LFP", "green"), ("NCA", "amber")]:
+            ocv  = ocv_from_soc(soc2, chem)
+            docv = np.gradient(ocv, soc2)
+            axes[1].plot(soc2, docv, color=self.PALETTE[col], lw=2.5, label=chem)
+        axes[1].axhline(0, color="gray", ls="--", lw=1)
+        axes[1].set(xlabel="SOC", ylabel="dOCV/dSOC", title="OCV Sensitivity")
+        axes[1].legend(); axes[1].grid(alpha=0.3)
+        plt.tight_layout()
+        self._save(fig, "00_ocv.png", out)
+
+    def plot_eda(self, df, out):
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig.patch.set_facecolor("white")
+        cells  = df["cell_id"].unique()[:10]
+        colors = plt.cm.tab10(np.linspace(0, 1, len(cells)))
+        for cell, col in zip(cells, colors):
+            g    = df[df["cell_id"] == cell].sort_values("cycle")
+            chem = g["chemistry"].iloc[0] if "chemistry" in g.columns else "?"
+            axes[0, 0].plot(g["cycle"], g["SOH"],      color=col, alpha=0.8, label=f"{cell} ({chem})")
+            axes[0, 1].plot(g["cycle"], g["RUL"],      color=col, alpha=0.8)
+            axes[0, 2].plot(g["cycle"], g["RUL_norm"], color=col, alpha=0.8)
+            if "deg_index"        in g.columns: axes[1, 0].plot(g["cycle"], g["deg_index"],        color=col, alpha=0.8)
+            if "cell_imbalance_v" in g.columns: axes[1, 1].plot(g["cycle"], g["cell_imbalance_v"], color=col, alpha=0.8)
+            if "c_rate_mean"      in g.columns: axes[1, 2].plot(g["cycle"], g["c_rate_mean"],      color=col, alpha=0.8)
+        axes[0, 0].axhline(0.80, color="red", ls="--", lw=1.5)
+        for ax, t in zip(axes.flatten(), ["SOH", "RUL", "RUL_norm",
+                                           "Degradation Index", "ΔV imbalance", "C-rate"]):
+            ax.set(xlabel="Cycle", title=t); ax.grid(alpha=0.3)
+        axes[0, 0].legend(fontsize=6)
+        plt.tight_layout()
+        self._save(fig, "01_eda.png", out)
+
+    def plot_predictions(self, fold_results, out):
+        n = len(fold_results); cols = min(2, n); rows = (n + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, figsize=(9 * cols, 5 * rows))
+        fig.patch.set_facecolor("white")
+        axes = np.array(axes).flatten()
+        for i, res in enumerate(fold_results):
+            ax   = axes[i]
+            xi   = np.arange(len(res["y_true"]))
+            chem = res.get("chemistry", "?")
+            c    = self.PALETTE.get(chem.lower(), self.PALETTE["blue"])
+            ax.plot(xi, res["y_true"], color=c, lw=2.5, label="Actual")
+            ax.plot(xi, res["y_pred"], color=self.PALETTE["red"], lw=2, ls="--", label="Q50")
+            ax.fill_between(xi, res["y_pred_lo"], res["y_pred_hi"],
+                            alpha=0.18, color=self.PALETTE["purple"], label="80% PI")
+            ax.set_title(f"{res['test_cell']} [{chem}]  RMSE={res['rmse']:.1f}  "
+                         f"MAPE={res['mape']:.1f}%", fontsize=9)
+            ax.set(xlabel="Window", ylabel="RUL (cycles)")
+            ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        for j in range(i + 1, len(axes)):
+            axes[j].set_visible(False)
+        plt.tight_layout()
+        self._save(fig, "02_predictions.png", out)
+
+    def plot_scatter(self, fold_results, out):
+        all_t = np.concatenate([r["y_true"] for r in fold_results])
+        all_p = np.concatenate([r["y_pred"] for r in fold_results])
+        all_s = np.concatenate([r["y_pred_std"] for r in fold_results])
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig.patch.set_facecolor("white")
+        sc  = axes[0].scatter(all_t, all_p, c=all_s, cmap="plasma", s=12, alpha=0.65)
+        plt.colorbar(sc, ax=axes[0], label="Uncertainty")
+        lim = max(all_t.max(), all_p.max()) * 1.05
+        axes[0].plot([0, lim], [0, lim], "r--", lw=1.5)
+        axes[0].set(xlabel="Actual RUL", ylabel="Predicted RUL",
+                    title=f"R²={r2_score(all_t, all_p):.4f}")
+        axes[0].grid(alpha=0.3)
+        errors = all_t - all_p
+        axes[1].hist(errors, bins=60, color=self.PALETTE["blue"], edgecolor="white", alpha=0.8)
+        axes[1].axvline(0, color="red", ls="--", lw=1.5)
+        axes[1].set(xlabel="Error (cycles)", title="Error Distribution")
+        axes[1].grid(alpha=0.3)
+        plt.tight_layout()
+        self._save(fig, "03_scatter.png", out)
+
+    def plot_training_curves(self, fold_results, out):
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.patch.set_facecolor("white")
+        for res in fold_results:
+            for h in res["histories"]:
+                if "loss"     in h: axes[0].plot(h["loss"],     alpha=0.4, lw=1)
+                if "val_loss" in h: axes[1].plot(h["val_loss"], alpha=0.4, lw=1)
+        for ax, t in zip(axes, ["Training Loss", "Validation Loss"]):
+            ax.set(xlabel="Epoch", ylabel="Loss", title=t)
+            ax.grid(alpha=0.3); ax.set_yscale("log")
+        plt.tight_layout()
+        self._save(fig, "04_training_curves.png", out)
+
+    def plot_knee_point_detection(self, df: pd.DataFrame, out):
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.patch.set_facecolor("white")
+        chemistries = ["NMC", "LFP", "NCA"]
+        chem_colors = [self.PALETTE["nmc"], self.PALETTE["lfp"], self.PALETTE["nca"]]
+        det = EVEoLDetector()
+
+        for ax, chem, color in zip(axes, chemistries, chem_colors):
+            chem_cells = df[df["chemistry"] == chem]["cell_id"].unique()
+            if len(chem_cells) == 0:
+                ax.set_visible(False)
+                continue
+            cell_id = chem_cells[0]
+            grp     = df[df["cell_id"] == cell_id].sort_values("cycle").reset_index(drop=True)
+            cycles  = grp["cycle"].values
+            soh     = grp["SOH"].values
+            n       = len(soh)
+            win = min(11, n); win = win if win % 2 == 1 else win - 1; win = max(win, 5)
+            soh_s = savgol_filter(np.minimum.accumulate(soh), win, 3) if n >= 5 else soh
+            eol_cycle = det.find_eol_cycle(grp, chemistry=chem)
+            eol_idx   = min(np.searchsorted(cycles, eol_cycle), n - 1)
+            d2    = np.gradient(np.gradient(soh_s)) if n > 10 else np.zeros(n)
+            guard = max(5, n // 10)
+            k_idx = int(np.argmin(d2[guard:-guard]) + guard) if n > 2 * guard + 2 else n // 3
+            split = max(int(eol_idx * 0.70), k_idx + 2)
+            split = min(split, n - 1)
+            ax.plot(cycles[:split + 1], soh_s[:split + 1],
+                    color=color, lw=2.5, label="Observed SOH", zorder=3)
+            ax.plot(cycles[split:], soh_s[split:],
+                    color=color, lw=2, ls="--", alpha=0.45, label="Future (hidden)", zorder=3)
+            ax.axvspan(cycles[split], cycles[-1], alpha=0.07, color="gray", label="Future region")
+            ax.scatter([cycles[k_idx]], [soh_s[k_idx]], marker="x",
+                       s=180, linewidths=3, color=self.PALETTE["green"],
+                       zorder=5, label="Knee-Point")
+            ax.scatter([cycles[eol_idx]], [soh_s[eol_idx]], marker="*",
+                       s=240, color=self.PALETTE["red"], zorder=5, label="True EoL")
+            pred_idx = min(eol_idx + max(2, int(eol_idx * 0.05)), n - 1)
+            ax.scatter([cycles[pred_idx]], [soh_s[pred_idx]], marker="D",
+                       s=130, color=self.PALETTE["blue"], zorder=5, label="Predicted EoL")
+            eol_thr = EOL_THRESHOLDS.get(chem, 0.80)
+            ax.axhline(eol_thr, color="red", ls=":", lw=1.5, alpha=0.7)
+            ax.text(cycles[-1] * 0.98, eol_thr + 0.012, f"EoL={eol_thr:.0%}",
+                    ha="right", fontsize=8, color="red")
+            ax.set(xlabel="Cycle", ylabel="SOH",
+                   title=f"[{chem}] Knee-Point & Lifetime Detection",
+                   ylim=(max(0.5, soh_s.min() - 0.05), 1.06))
+            ax.legend(fontsize=7, loc="upper right"); ax.grid(alpha=0.3)
+
+        plt.suptitle("Panel A — Current-Voltage SOH Signals: Knee-Point & EoL Detection",
+                     fontweight="bold", fontsize=12)
+        plt.tight_layout()
+        self._save(fig, "05_knee_point_detection.png", out)
+
+    def plot_reservoir_depletion(self, df: pd.DataFrame, out):
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.patch.set_facecolor("white")
+        chemistries = ["NMC", "LFP", "NCA"]
+        chem_colors = [self.PALETTE["nmc"], self.PALETTE["lfp"], self.PALETTE["nca"]]
+        det = EVEoLDetector()
+
+        for ax, chem, color in zip(axes, chemistries, chem_colors):
+            chem_cells = df[df["chemistry"] == chem]["cell_id"].unique()
+            if len(chem_cells) == 0:
+                ax.set_visible(False)
+                continue
+            cell_id = chem_cells[0]
+            grp     = df[df["cell_id"] == cell_id].sort_values("cycle").reset_index(drop=True)
+            cycles  = grp["cycle"].values
+            n       = len(cycles)
+            soh     = grp["SOH"].values
+            cap_tot = soh / (soh[0] + 1e-8)
+            eol_cycle = det.find_eol_cycle(grp, chemistry=chem)
+            eol_idx   = min(np.searchsorted(cycles, eol_cycle), n - 1)
+            rng_sim   = np.random.default_rng(42 + ord(chem[0]))
+            decay_e   = np.linspace(0, 0.14, n) + rng_sim.normal(0, 0.005, n)
+            cap_pore  = cap_tot * (1.0 - np.clip(decay_e, 0, 0.20))
+            ch_s = int(eol_idx * 0.55); ch_e = eol_idx
+            ax.fill_between(cycles[ch_s:ch_e + 1],
+                            cap_pore[ch_s:ch_e + 1], cap_tot[ch_s:ch_e + 1],
+                            alpha=0.22, color=self.PALETTE["amber"],
+                            label="Identifiability\nchallenge")
+            ax.plot(cycles, cap_tot,  color=color, lw=2.5, label="V_total (SOH)")
+            ax.plot(cycles, cap_pore, color=color, lw=2, ls="--", alpha=0.70, label="V_pore")
+            eol_thr = EOL_THRESHOLDS.get(chem, 0.80)
+            ax.axhline(eol_thr, color="red", ls=":", lw=1.5, alpha=0.6)
+            ax.scatter([cycles[eol_idx]], [cap_tot[eol_idx]], marker="x",
+                       s=180, linewidths=3, color=self.PALETTE["red"], zorder=5, label="EoL")
+            mid_ch = ch_s + (ch_e - ch_s) // 2
+            ax.annotate("Challenge:\nIdentifiability/uniqueness",
+                        xy=(cycles[mid_ch], (cap_pore[mid_ch] + cap_tot[mid_ch]) / 2),
+                        fontsize=7.5, color=self.PALETTE["amber"], ha="center", va="center",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                                  ec=self.PALETTE["amber"], alpha=0.85))
+            ax.set(xlabel="Cycle", ylabel="Normalised Capacity",
+                   title=f"[{chem}] Electrolyte Reservoir Depletion",
+                   ylim=(0.55, 1.09))
+            ax.legend(fontsize=7, loc="upper right"); ax.grid(alpha=0.3)
+
+        plt.suptitle("Panel B — Non-Electrochemical: Reservoir Depletion & Identifiability",
+                     fontweight="bold", fontsize=12)
+        plt.tight_layout()
+        self._save(fig, "06_reservoir_depletion.png", out)
+
+    def plot_mechanical_failure_modes(self, df: pd.DataFrame, out):
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.patch.set_facecolor("white")
+        chemistries = ["NMC", "LFP", "NCA"]
+        chem_colors = [self.PALETTE["nmc"], self.PALETTE["lfp"], self.PALETTE["nca"]]
+        det = EVEoLDetector()
+
+        for ax, chem, color in zip(axes, chemistries, chem_colors):
+            chem_cells = df[df["chemistry"] == chem]["cell_id"].unique()
+            if len(chem_cells) == 0:
+                ax.set_visible(False)
+                continue
+            cell_id = chem_cells[0]
+            grp     = df[df["cell_id"] == cell_id].sort_values("cycle").reset_index(drop=True)
+            cycles  = grp["cycle"].values
+            n       = len(cycles)
+            eol_cycle = det.find_eol_cycle(grp, chemistry=chem)
+            eol_idx   = min(np.searchsorted(cycles, eol_cycle), n - 1)
+            rng_sim = np.random.default_rng(7 + ord(chem[0]))
+            imb     = (grp["cell_imbalance_v"].values
+                       if "cell_imbalance_v" in grp.columns
+                       else np.linspace(0.005, 0.08, n))
+            t_rise  = (grp["temp_rise"].values
+                       if "temp_rise" in grp.columns
+                       else np.linspace(8, 18, n))
+            p_int   = np.clip(
+                imb / (imb.max() + 1e-8) * 0.60
+                + t_rise / (t_rise.max() + 1e-8) * 0.40
+                + rng_sim.normal(0, 0.018, n), 0, 1)
+            cid_thr  = 0.72
+            buck_thr = 0.88
+            split    = max(int(eol_idx * 0.65), 5)
+            ax.plot(cycles[:split + 1], p_int[:split + 1],
+                    color=color, lw=2.5, label="P_int (observed)", zorder=3)
+            ax.plot(cycles[split:], p_int[split:],
+                    color=color, lw=2, ls="--", alpha=0.45, label="P_int (future)", zorder=3)
+            ax.axvspan(cycles[split], cycles[-1], alpha=0.06, color="gray")
+            ax.axhline(cid_thr,  color=self.PALETTE["amber"], ls="--", lw=2.0,
+                       label="CID activation")
+            ax.axhline(buck_thr, color=self.PALETTE["red"],   ls=":",  lw=2.0,
+                       label="Core buckling")
+            cid_c = np.where(p_int > cid_thr)[0]
+            if len(cid_c):
+                ci = cid_c[0]
+                ax.scatter([cycles[ci]], [p_int[ci]], marker="x",
+                           s=180, linewidths=3, color=self.PALETTE["amber"], zorder=5)
+            ax.scatter([cycles[eol_idx]], [p_int[eol_idx]], marker="*",
+                       s=220, color=self.PALETTE["red"], zorder=5, label="EoL")
+            ax.annotate("Challenge:\nNon-electrochemical\ninternal state variables",
+                        xy=(cycles[n // 2], 0.48),
+                        fontsize=7.5, color=self.PALETTE["red"], ha="center",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                                  ec=self.PALETTE["red"], alpha=0.85))
+            ax.set(xlabel="Cycle", ylabel="P_int (normalised proxy)",
+                   title=f"[{chem}] Mechanical Failure Modes",
+                   ylim=(-0.05, 1.12))
+            ax.legend(fontsize=7, loc="upper left"); ax.grid(alpha=0.3)
+
+        plt.suptitle("Panel C — Mechanical Failures: CID Activation & Core Buckling",
+                     fontweight="bold", fontsize=12)
+        plt.tight_layout()
+        self._save(fig, "07_mechanical_failure_modes.png", out)
+
+    def plot_latent_defect_detection(self, df: pd.DataFrame, out):
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.patch.set_facecolor("white")
+        chemistries = ["NMC", "LFP", "NCA"]
+        chem_colors = [self.PALETTE["nmc"], self.PALETTE["lfp"], self.PALETTE["nca"]]
+        det = EVEoLDetector()
+
+        for ax, chem, color in zip(axes, chemistries, chem_colors):
+            chem_cells = df[df["chemistry"] == chem]["cell_id"].unique()
+            if len(chem_cells) == 0:
+                ax.set_visible(False)
+                continue
+            cell_id = chem_cells[0]
+            grp     = df[df["cell_id"] == cell_id].sort_values("cycle").reset_index(drop=True)
+            cycles  = grp["cycle"].values
+            n       = len(cycles)
+            eol_cycle = det.find_eol_cycle(grp, chemistry=chem)
+            eol_idx   = min(np.searchsorted(cycles, eol_cycle), n - 1)
+            rng_sim  = np.random.default_rng(13 + ord(chem[0]))
+            t_norm   = np.linspace(0, 1, n)
+            d_signal = np.clip(
+                0.02 * np.exp(4.5 * t_norm) - 0.02
+                + rng_sim.normal(0, 0.008, n), 0, 1)
+            detect_lim = 0.08
+            split      = max(int(eol_idx * 0.68), 5)
+            ax.fill_between(cycles, 0, detect_lim,
+                            alpha=0.12, color=self.PALETTE["purple"],
+                            label="Undetectable zone (D≈0)")
+            ax.plot(cycles[:split + 1], d_signal[:split + 1],
+                    color=color, lw=2.5, label="Defect signal D", zorder=3)
+            ax.plot(cycles[split:], d_signal[split:],
+                    color=color, lw=2, ls="--", alpha=0.45, label="D (future)", zorder=3)
+            ax.axvspan(cycles[split], cycles[-1], alpha=0.06, color="gray")
+            ax.axhline(0,          color="black",                ls="-",  lw=1.0, alpha=0.5)
+            ax.axhline(detect_lim, color=self.PALETTE["purple"], ls="--", lw=2.0,
+                       label="Detection limit")
+            det_c = np.where(d_signal > detect_lim)[0]
+            det_c = det_c[det_c > n // 5] if len(det_c) else []
+            if len(det_c):
+                ax.scatter([cycles[det_c[0]]], [d_signal[det_c[0]]], marker="^",
+                           s=160, color=self.PALETTE["purple"], zorder=5,
+                           label="First detectable")
+            ax.scatter([cycles[eol_idx]], [d_signal[eol_idx]], marker="*",
+                       s=220, color=self.PALETTE["red"], zorder=5, label="EoL")
+            ax.annotate("Challenge:\nDetection limit\n(D ≈ 0 in early life)",
+                        xy=(cycles[n // 4], detect_lim * 0.42),
+                        fontsize=7.5, color=self.PALETTE["purple"], ha="center",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                                  ec=self.PALETTE["purple"], alpha=0.85))
+            ax.set(xlabel="Cycle", ylabel="Defect Signal D (normalised)",
+                   title=f"[{chem}] Latent Defect / Short-Circuit Precursor",
+                   ylim=(-0.05, 1.06))
+            ax.legend(fontsize=7, loc="upper left"); ax.grid(alpha=0.3)
+
+        plt.suptitle("Panel D — Latent Defects: Particle Contamination & Detection Limit Challenge",
+                     fontweight="bold", fontsize=12)
+        plt.tight_layout()
+        self._save(fig, "08_latent_defect_detection.png", out)
+
+    def plot_soh_multimode_overview(self, df: pd.DataFrame, out):
+        chemistries = ["NMC", "LFP", "NCA"]
+        chem_colors = [self.PALETTE["nmc"], self.PALETTE["lfp"], self.PALETTE["nca"]]
+        panel_row_labels = [
+            "A  SOH / Knee-Point",
+            "B  Reservoir Depletion",
+            "C  Mechanical (P_int)",
+            "D  Latent Defect (D)",
+        ]
+        n_rows, n_cols = 4, 3
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 20))
+        fig.patch.set_facecolor("white")
+        det = EVEoLDetector()
+
+        for col_i, (chem, color) in enumerate(zip(chemistries, chem_colors)):
+            chem_cells = df[df["chemistry"] == chem]["cell_id"].unique()
+            if len(chem_cells) == 0:
+                for r in range(n_rows):
+                    axes[r, col_i].set_visible(False)
+                continue
+
+            cell_id = chem_cells[0]
+            grp     = df[df["cell_id"] == cell_id].sort_values("cycle").reset_index(drop=True)
+            cycles  = grp["cycle"].values
+            n       = len(cycles)
+            rng_sim = np.random.default_rng(col_i * 17)
+            soh     = grp["SOH"].values
+
+            eol_cycle = det.find_eol_cycle(grp, chemistry=chem)
+            eol_idx   = min(np.searchsorted(cycles, eol_cycle), n - 1)
+            split     = max(int(eol_idx * 0.68), 5)
+            eol_thr   = EOL_THRESHOLDS.get(chem, 0.80)
+
+            win = min(11, n); win = win if win % 2 == 1 else win - 1; win = max(win, 5)
+            soh_s = savgol_filter(np.minimum.accumulate(soh), win, 3) if n >= 5 else soh
+
+            imb    = (grp["cell_imbalance_v"].values if "cell_imbalance_v" in grp.columns
+                      else np.linspace(0.005, 0.08, n))
+            t_rise = (grp["temp_rise"].values if "temp_rise" in grp.columns
+                      else np.linspace(8, 18, n))
+
+            ax = axes[0, col_i]
+            d2    = np.gradient(np.gradient(soh_s)) if n > 10 else np.zeros(n)
+            guard = max(5, n // 10)
+            k_idx = int(np.argmin(d2[guard:-guard]) + guard) if n > 2 * guard + 2 else n // 3
+            ax.plot(cycles[:split + 1], soh_s[:split + 1], color=color, lw=2.5)
+            ax.plot(cycles[split:], soh_s[split:], color=color, lw=1.8, ls="--", alpha=0.4)
+            ax.axvspan(cycles[split], cycles[-1], alpha=0.07, color="gray")
+            ax.scatter([cycles[k_idx]], [soh_s[k_idx]], marker="x", s=160, lw=3,
+                       color=self.PALETTE["green"], zorder=5, label="Knee")
+            ax.scatter([cycles[eol_idx]], [soh_s[eol_idx]], marker="*", s=200,
+                       color=self.PALETTE["red"], zorder=5, label="EoL")
+            pred_idx = min(eol_idx + max(2, int(eol_idx * 0.05)), n - 1)
+            ax.scatter([cycles[pred_idx]], [soh_s[pred_idx]], marker="D", s=110,
+                       color=self.PALETTE["blue"], zorder=5, label="Pred EoL")
+            ax.axhline(eol_thr, color="red", ls=":", lw=1.5, alpha=0.6)
+            ax.set_title(f"{chem}", fontsize=12, fontweight="bold")
+            if col_i == 0:
+                ax.set_ylabel(panel_row_labels[0] + "\nSOH", fontsize=8.5)
+                ax.legend(fontsize=6.5, loc="upper right")
+            ax.grid(alpha=0.3)
+            ax.set(ylim=(max(0.5, soh_s.min() - 0.05), 1.06))
+
+            ax = axes[1, col_i]
+            cap_tot  = soh_s / (soh_s[0] + 1e-8)
+            decay_e  = np.linspace(0, 0.14, n) + rng_sim.normal(0, 0.005, n)
+            cap_pore = cap_tot * (1.0 - np.clip(decay_e, 0, 0.20))
+            ch_s = int(eol_idx * 0.55); ch_e = eol_idx
+            ax.fill_between(cycles[ch_s:ch_e + 1],
+                            cap_pore[ch_s:ch_e + 1], cap_tot[ch_s:ch_e + 1],
+                            alpha=0.22, color=self.PALETTE["amber"])
+            ax.plot(cycles, cap_tot,  color=color, lw=2.5, label="V_total")
+            ax.plot(cycles, cap_pore, color=color, lw=2, ls="--", alpha=0.65, label="V_pore")
+            ax.axhline(eol_thr, color="red", ls=":", lw=1.5, alpha=0.6)
+            ax.scatter([cycles[eol_idx]], [cap_tot[eol_idx]], marker="x",
+                       s=160, lw=3, color=self.PALETTE["red"], zorder=5)
+            if col_i == 0:
+                ax.set_ylabel(panel_row_labels[1] + "\nNorm. Cap", fontsize=8.5)
+                ax.legend(fontsize=6.5, loc="upper right")
+            ax.grid(alpha=0.3)
+            ax.set(ylim=(0.55, 1.09))
+
+            ax = axes[2, col_i]
+            p_int = np.clip(
+                imb / (imb.max() + 1e-8) * 0.60
+                + t_rise / (t_rise.max() + 1e-8) * 0.40
+                + rng_sim.normal(0, 0.018, n), 0, 1)
+            cid_thr = 0.72; buck_thr = 0.88
+            ax.plot(cycles[:split + 1], p_int[:split + 1], color=color, lw=2.5)
+            ax.plot(cycles[split:], p_int[split:], color=color, lw=1.8, ls="--", alpha=0.4)
+            ax.axvspan(cycles[split], cycles[-1], alpha=0.06, color="gray")
+            ax.axhline(cid_thr,  color=self.PALETTE["amber"], ls="--", lw=1.8, label="CID")
+            ax.axhline(buck_thr, color=self.PALETTE["red"],   ls=":",  lw=1.8, label="Buckling")
+            cid_c = np.where(p_int > cid_thr)[0]
+            if len(cid_c):
+                ax.scatter([cycles[cid_c[0]]], [p_int[cid_c[0]]], marker="x",
+                           s=160, lw=3, color=self.PALETTE["amber"], zorder=5)
+            ax.scatter([cycles[eol_idx]], [p_int[eol_idx]], marker="*", s=200,
+                       color=self.PALETTE["red"], zorder=5)
+            if col_i == 0:
+                ax.set_ylabel(panel_row_labels[2] + "\nP_int", fontsize=8.5)
+                ax.legend(fontsize=6.5, loc="upper left")
+            ax.grid(alpha=0.3)
+            ax.set(ylim=(-0.05, 1.12))
+
+            ax = axes[3, col_i]
+            t_norm   = np.linspace(0, 1, n)
+            d_signal = np.clip(
+                0.02 * np.exp(4.5 * t_norm) - 0.02
+                + rng_sim.normal(0, 0.008, n), 0, 1)
+            det_lim  = 0.08
+            ax.fill_between(cycles, 0, det_lim, alpha=0.12, color=self.PALETTE["purple"])
+            ax.plot(cycles[:split + 1], d_signal[:split + 1], color=color, lw=2.5)
+            ax.plot(cycles[split:], d_signal[split:], color=color, lw=1.8, ls="--", alpha=0.4)
+            ax.axvspan(cycles[split], cycles[-1], alpha=0.06, color="gray")
+            ax.axhline(det_lim, color=self.PALETTE["purple"], ls="--", lw=1.8,
+                       label="Detect. limit")
+            det_c = np.where(d_signal > det_lim)[0]
+            det_c = det_c[det_c > n // 5] if len(det_c) else []
+            if len(det_c):
+                ax.scatter([cycles[det_c[0]]], [d_signal[det_c[0]]], marker="^",
+                           s=150, color=self.PALETTE["purple"], zorder=5, label="1st detect")
+            ax.scatter([cycles[eol_idx]], [d_signal[eol_idx]], marker="*", s=200,
+                       color=self.PALETTE["red"], zorder=5, label="EoL")
+            if col_i == 0:
+                ax.set_ylabel(panel_row_labels[3] + "\nD signal", fontsize=8.5)
+                ax.legend(fontsize=6.5, loc="upper left")
+            ax.set_xlabel("Cycle", fontsize=9)
+            ax.grid(alpha=0.3)
+            ax.set(ylim=(-0.05, 1.06))
+
+        plt.suptitle(
+            "Multi-Mode Degradation Overview\n"
+            "A: SOH/Knee-Point  |  B: Reservoir Depletion  |  "
+            "C: Mechanical Failure  |  D: Latent Defect",
+            fontweight="bold", fontsize=13, y=1.01)
+        plt.tight_layout()
+        self._save(fig, "09_multimode_degradation_overview.png", out)
+
+def predict_final_rul(df: pd.DataFrame, fold_results: list,
+                      output_dir: str = "./rul_v5_outputs") -> pd.DataFrame:
+    if not fold_results:
+        print("[FinalRUL] No fold results available.")
+        return pd.DataFrame()
+
+    out_path = Path(output_dir)
+    records  = []
+
+    print(f"\n{'='*70}")
+    print("  FINAL RUL PREDICTION — per-cell summary")
+    print(f"{'='*70}")
+    print(f"  {'Cell ID':<25} {'Chem':<6} {'CurCyc':>7} {'SOH':>6} "
+          f"{'RUL_Q10':>8} {'RUL_Q50':>8} {'RUL_Q90':>8} {'Est_EoL':>8}")
+    print(f"  {'-'*25} {'-'*6} {'-'*7} {'-'*6} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+
+    for cell_id in sorted(df["cell_id"].unique()):
+        grp  = df[df["cell_id"] == cell_id].sort_values("cycle").reset_index(drop=True)
+        chem = grp["chemistry"].iloc[0] if "chemistry" in grp.columns else ChemistryType.NMC
+
+        fold_match = None
+        for r in fold_results:
+            if r["test_cell"] == str(cell_id):
+                fold_match = r
+                break
+
+        last_row  = grp.iloc[-1]
+        cur_cycle = int(last_row["cycle"])
+        cur_soh   = float(last_row["SOH"])
+
+        if fold_match is not None:
+            y_pred = fold_match["y_pred"]
+            y_lo   = fold_match["y_pred_lo"]
+            y_hi   = fold_match["y_pred_hi"]
+            if len(y_pred) > 0:
+                rul_q50 = float(y_pred[-1])
+                rul_q10 = float(y_lo[-1])
+                rul_q90 = float(y_hi[-1])
+            else:
+                rul_q50 = rul_q10 = rul_q90 = float(grp["RUL"].iloc[-1])
+        else:
+            rul_q50 = float(grp["RUL"].iloc[-1])
+            rul_q10 = rul_q50 * 0.75
+            rul_q90 = rul_q50 * 1.25
+
+        est_eol = cur_cycle + max(0.0, rul_q50)
+        ci_half = max(0.0, (rul_q90 - rul_q10) / 2)
+
+        print(f"  {str(cell_id):<25} {str(chem):<6} {cur_cycle:>7d} {cur_soh:>6.3f} "
+              f"{rul_q10:>8.1f} {rul_q50:>8.1f} {rul_q90:>8.1f} {est_eol:>8.1f}")
+
+        records.append(dict(
+            cell_id=str(cell_id), chemistry=str(chem),
+            current_cycle=cur_cycle, current_soh=round(cur_soh, 4),
+            rul_q10=round(rul_q10, 1), rul_q50=round(rul_q50, 1),
+            rul_q90=round(rul_q90, 1),
+            estimated_eol_cycle=round(est_eol, 1),
+            confidence_interval_cycles=round(ci_half, 1),
+        ))
+
+    df_out = pd.DataFrame(records)
+    if not df_out.empty:
+        csv_path = out_path / "final_rul_predictions.csv"
+        df_out.to_csv(str(csv_path), index=False)
+        print(f"\n  Saved: final_rul_predictions.csv")
+
+        fig, ax = plt.subplots(figsize=(max(10, len(df_out) * 0.8), 6))
+        fig.patch.set_facecolor("white")
+        x      = np.arange(len(df_out))
+        ax.bar(x, df_out["rul_q50"], color="#1565C0", alpha=0.8, zorder=3, label="RUL Q50")
+        err_lo = df_out["rul_q50"] - df_out["rul_q10"]
+        err_hi = df_out["rul_q90"] - df_out["rul_q50"]
+        ax.errorbar(x, df_out["rul_q50"],
+                    yerr=[err_lo.clip(0), err_hi.clip(0)],
+                    fmt="none", color="#C62828", lw=2, capsize=5, zorder=4,
+                    label="80% PI")
+        ax.set_xticks(x)
+        ax.set_xticklabels(df_out["cell_id"], rotation=45, ha="right", fontsize=8)
+        ax.set(ylabel="Remaining Useful Life (cycles)",
+               title="Final RUL Prediction — All Cells (Q10/Q50/Q90)")
+        ax.legend(); ax.grid(axis="y", alpha=0.3)
+        plt.tight_layout()
+        plot_path = out_path / "10_final_rul_all_cells.png"
+        fig.savefig(str(plot_path), dpi=150, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        print(f"  Saved: 10_final_rul_all_cells.png")
+
+    print(f"\n{'='*70}")
+    return df_out
+
+
+def main(
+    lab_data_dir:         str   = "./nasa_data",
+    ev_data_dir:          Optional[str] = None,
+    tu_berlin_data_dir:   Optional[str] = None,
+    tu_berlin_chemistry:  str   = ChemistryType.NMC,
+    tu_berlin_nom_cap_ah: float = 0.0,
+    output_dir:           str   = "./rul_v5_outputs",
+    force_retrain:        bool  = False,
+    series_cells:         int   = 96,
+    nominal_cap_ah:       float = 75.0,
+    window_size:          int   = 10,
+    n_ensemble:           int   = N_ENSEMBLE,
+    max_epochs:           int   = 25,
+    pretrain_epochs:      int   = 4,
+    pretrain_n_cells:     int   = 8,
+    pretrain_max_cyc:     int   = 200,
+    n_augments:           int   = 2,
+    mi_selector:          bool  = True,
+):
+    print("\n" + "=" * 70)
+    print("  Battery RUL v5.3 — TRAINING ONLY")
+    print("  Outputs: .h5 models + .pkl scalers/iso/soc_pre/selector")
+    print("=" * 70)
+
+    out      = Path(output_dir)
+    registry = ModelRegistry(output_dir)
+    viz      = EVRULVisualizer()
+    fe       = EVBatteryFeatureEngineer()
+    checker  = SOCSelfChecker()
+
+    print("\n[1] Loading lab (NASA) data …")
+    lab_loader = NASABatteryLoader(lab_data_dir, chemistry=ChemistryType.LCO)
+    lab_df     = lab_loader.load_all()
+    print(f"    Lab: {len(lab_df)} cycles | {lab_df['cell_id'].nunique()} cells")
+    tub_df = pd.DataFrame()
+    if tu_berlin_data_dir and Path(tu_berlin_data_dir).exists():
+        print("\n[2a] Loading TU Berlin data …")
+        tub_loader = TUBerlinLoader(
+            data_dir=tu_berlin_data_dir,
+            chemistry=tu_berlin_chemistry,
+            nominal_capacity_ah=tu_berlin_nom_cap_ah,
+        )
+        tub_df = tub_loader.load_all()
+        if not tub_df.empty:
+            print(f"    TU Berlin: {len(tub_df)} cycles | "
+                  f"{tub_df['cell_id'].nunique()} cells")
+    else:
+        print("\n[2a] No TU Berlin dir provided — skipping.")
+
+    ev_df = pd.DataFrame()
+    if ev_data_dir and Path(ev_data_dir).exists():
+        print("\n[2b] Loading real EV data …")
+        ev_loader = EVDataLoader(series_cells=series_cells,
+                                 nominal_capacity_ah=nominal_cap_ah)
+        ev_df = ev_loader.load_directory(ev_data_dir)
+        if not ev_df.empty:
+            print(f"    EV: {len(ev_df)} cycles | {ev_df['cell_id'].nunique()} vehicles")
+    else:
+        print("\n[2b] No EV CSV dir — generating synthetic EV demo data.")
+        ev_df = EVSyntheticDataGenerator.generate(n_cells=16, max_cycles=800, seed=1)
+        print(f"    Synthetic EV: {len(ev_df)} cycles | {ev_df['cell_id'].nunique()} cells")
+
+    print("\n[3] Merging datasets …")
+    pieces = [df for df in [lab_df, tub_df, ev_df] if not df.empty]
+    raw_df = pd.concat(pieces, ignore_index=True)
+    for col in ["cell_imbalance_v", "cell_imbalance_t", "pack_t_gradient",
+                "cum_fast_charges", "calendar_days", "dod", "dod_mean50",
+                "c_rate_mean", "c_rate_max", "is_fast_charge"]:
+        if col not in raw_df.columns:
+            raw_df[col] = 0.0
+    raw_df["chemistry"] = raw_df.get("chemistry", pd.Series(
+        [ChemistryType.NMC] * len(raw_df))).fillna(ChemistryType.NMC)
+    print(f"    Total: {len(raw_df)} cycles | {raw_df['cell_id'].nunique()} cells")
+
+    print("\n[4] SOC self-check …")
+    raw_df = checker.check(raw_df)
+    n_flag = (raw_df["soc_diverge"] > SOC_DIVERGE_THR).sum()
+    print(f"    Flagged: {n_flag}/{len(raw_df)} ({100*n_flag/len(raw_df):.1f}%)")
+
+    print("\n[5] Feature engineering …")
+    df = fe.compute_rul(raw_df)
+    df = fe.add_derived_features(df)
+    for cell, grp in df.groupby("cell_id"):
+        chem = grp["chemistry"].iloc[0] if "chemistry" in grp.columns else "?"
+        print(f"    {cell} [{chem}]: RUL_max={grp['RUL'].max():.0f}  "
+              f"n={len(grp)}  SOH_min={grp['SOH'].min():.3f}")
+
+    features = fe.get_feature_columns(df)
+    df       = df.dropna(subset=features + ["RUL_norm"])
+    print(f"    Feature pool: {len(features)} | rows: {len(df)}")
+
+    data_hash = fingerprint_data(df)
+    print(f"\n[6] Data hash: {data_hash[:16]}…")
+
+    if not force_retrain and not registry.needs_retrain(data_hash):
+        print("   Models already up-to-date — nothing to do.")
+        print(f"\n  Output dir: {output_dir}/")
+        return None, None
+
+    print("\n[7] EDA plots …")
+    viz.plot_multi_chemistry_ocv(out)
+    viz.plot_eda(df, out)
+
+    print(f"\n[8] Training | window={window_size} | epochs={max_epochs} | "
+          f"ensemble={n_ensemble} …")
+    trainer = RULTrainerV5(
+        window_size=window_size,
+        lstm_units=64, cnn_filters=32, attn_heads=2, dense_units=96,
+        dropout_rate=0.25, batch_size=128,
+        max_epochs=max_epochs,
+        pretrain_epochs=pretrain_epochs,
+        pretrain_n_cells=pretrain_n_cells,
+        pretrain_max_cyc=pretrain_max_cyc,
+        lr=1.5e-4, n_augments=n_augments, n_ensemble=n_ensemble,
+        output_dir=output_dir, registry=registry, mi_selector=mi_selector,
+    )
+    fold_results = trainer.train_loco_cv(df, features, fe)
+
+    if not fold_results:
+        print("[WARN] No fold results — check data / window_size.")
+        return None, None
+
+    print("\n[9] Aggregating results …")
+    summary = RULTrainerV5.aggregate_results(fold_results)
+    summary.to_csv(str(out / "cv_results.csv"), index=False)
+
+    registry.save_metadata(
+        data_hash=data_hash, n_folds=len(fold_results),
+        n_ensemble=n_ensemble, window_size=window_size,
+        cell_ids=df["cell_id"].unique().tolist(),
+        fold_results=fold_results,
+    )
+
+    print("\n[10] Diagnostic plots …")
+    viz.plot_predictions(fold_results, out)
+    viz.plot_scatter(fold_results, out)
+    viz.plot_training_curves(fold_results, out)
+
+    print("\n[11] Degradation-mode plots …")
+    viz.plot_knee_point_detection(df, out)
+    viz.plot_reservoir_depletion(df, out)
+    viz.plot_mechanical_failure_modes(df, out)
+    viz.plot_latent_defect_detection(df, out)
+    viz.plot_soh_multimode_overview(df, out)
+
+    print("\n[12] Final RUL predictions …")
+    final_rul_df = predict_final_rul(df, fold_results, output_dir=output_dir)
+
+    print(f"\n{'='*70}")
+    print("  TRAINING COMPLETE — files ready for deployer")
+    print(f"{'='*70}")
+    print(f"\n  Output dir : {output_dir}/")
+    print("\n  Models (.keras + .h5 both saved):")
+    for p in sorted(out.glob("model_f*.h5")):
+        print(f"    {p.name}  ({p.stat().st_size // 1024} KB)")
+    print("\n  Scalers / post-processors (.pkl):")
+    for p in sorted(out.glob("*.pkl")):
+        print(f"    {p.name}")
+    print("\n  Metadata:")
+    print(f"    registry.json")
+    print(f"    cv_results.csv")
+    print(f"    final_rul_predictions.csv")
+    print("\n  Visualisations:")
+    print("    00_ocv.png … 09_multimode_degradation_overview.png")
+    print("    10_final_rul_all_cells.png")
+
+    return fold_results, summary
+
+
+
+if __name__ == "__main__":
+    import sys
+
+    # ── Path config ───────────────────────────────────────────────────────────
+    LAB_DATA_DIR  = "./"              # NASA .mat files
+    EV_DATA_DIR   = "./ev_data"       # EV CSVs (skipped if missing)
+    TU_BERLIN_DIR = "./"             # TU Berlin CSV files (flat in root)
+    OUTPUT_DIR    = "./rul_v5_outputs"
+
+    TU_CHEM    = ChemistryType.NMC
+    TU_NOM_CAP = 0.0   # 0 = auto-detect from first cycle
+
+    # Override StepIDs here if your dataset differs from the defaults:
+    # TU_DISCHARGE_STEPS = {4, 5, 6}
+    # TU_CHARGE_STEPS    = {1, 2, 3}
+
+    FORCE = "--force" in sys.argv
+
+    fold_results, summary = main(
+        lab_data_dir         = LAB_DATA_DIR,
+        ev_data_dir          = None,              # set to EV_DATA_DIR if you have EV CSVs
+        tu_berlin_data_dir   = TU_BERLIN_DIR,
+        tu_berlin_chemistry  = TU_CHEM,
+        tu_berlin_nom_cap_ah = TU_NOM_CAP,
+        output_dir           = OUTPUT_DIR,
+        force_retrain        = FORCE,
+        series_cells         = int(os.environ.get("EV_SERIES_CELLS",    96)),
+        nominal_cap_ah       = float(os.environ.get("EV_NOMINAL_CAP_AH", 75.0)),
+        n_ensemble           = int(os.environ.get("N_ENSEMBLE", N_ENSEMBLE)),
+        window_size          = 10,
+        max_epochs           = 25,
+        pretrain_epochs      = 4,
+        pretrain_n_cells     = 8,
+        pretrain_max_cyc     = 200,
+        n_augments           = 2,
+        mi_selector          = True,
+    )

@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  # RUL Service - Node.js + Python ML backend
+  rul-service:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: evchamp-rul-service
+    ports:
+      - "5000:5000"
+    environment:
+      # Server Configuration
+      - NODE_ENV=production
+      - PORT=5000
+      
+      # Database
+      - DATABASE_URL=${DATABASE_URL:-postgresql://user:pass@localhost:5432/evchamp}
+      
+      # Authentication
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
+      - REACT_APP_CLERK_PUBLISHABLE_KEY=${REACT_APP_CLERK_PUBLISHABLE_KEY}
+      - NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+      
+      # Optional: Razorpay
+      - REACT_APP_RAZORPAY_KEY_ID=${REACT_APP_RAZORPAY_KEY_ID}
+      - REACT_APP_RAZORPAY_KEY_SECRET=${REACT_APP_RAZORPAY_KEY_SECRET}
+      
+      # Python paths
+      - PYTHONPATH=/app:/app/models
+    
+    volumes:
+      # Mount models as read-only for inference
+      - ./models:/app/../models:ro
+      # Mount server code for development (optional)
+      - ./server:/app
+      # Mount logs directory
+      - ./logs:/app/logs
+    
+    networks:
+      - evchamp-network
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    
+    depends_on:
+      - postgres
+    
+    # Override entry point (optional for debugging)
+    # command: /bin/sh -c "npm start"
+
+  # PostgreSQL Database (Neon - external, shown for reference)
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: evchamp-db
+  #   environment:
+  #     - POSTGRES_USER=evchamp_user
+  #     - POSTGRES_PASSWORD=secure_password
+  #     - POSTGRES_DB=evchamp
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   networks:
+  #     - evchamp-network
+  #   ports:
+  #     - "5432:5432"
+
+networks:
+  evchamp-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# volumes:
+#   postgres-data:
+#     driver: local
